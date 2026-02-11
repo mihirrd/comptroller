@@ -1,58 +1,53 @@
-import time
-import tiktoken
-from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from dotenv import load_dotenv
 
-client = OpenAI()
+load_dotenv()
 
-MODEL = "gpt-4o-mini"
-enc = tiktoken.encoding_for_model(MODEL)
+class StreamingTokenBudget:
+    def __init__(self, max_tokens: int):
+        self.max_tokens = max_tokens
+        self.current_tokens = 0
+    
+    def check_and_increment(self, chunk_tokens: int):
+        self.current_tokens += chunk_tokens
+        if self.current_tokens > self.max_tokens:
+            raise TokenBudgetExceededError(
+                f"Token budget exceeded mid-generation: {self.current_tokens}/{self.max_tokens}"
+            )
 
-def count_tokens(text: str) -> int:
-    return len(enc.encode(text))
+class TokenBudgetExceededError(Exception):
+    pass
 
+def stream_with_budget(chain, input_data, budget: StreamingTokenBudget):
+    """Stream response and halt if budget exceeded"""
+    result = ""
+    try:
+        for chunk in chain.stream(input_data):
+            chunk_text = chunk.content if hasattr(chunk, 'content') else str(chunk)
+            chunk_tokens = len(chunk_text.split()) * 1.3  # Rough estimate
+            
+            budget.check_and_increment(int(chunk_tokens))
+            result += chunk_text
+            print(chunk_text, end="", flush=True)
+        
+        return result
+    except TokenBudgetExceededError as e:
+        print(f"\n\n❌ HALTED: {e}")
+        return result
 
-def stream_with_live_token_usage(prompt: str):
-    total_output_tokens = 0
-    start_time = time.time()
-    full_response = ""
+# Usage
+llm = ChatOpenAI(streaming=True)
+prompt = ChatPromptTemplate.from_template("Write a long essay about: {topic}")
+chain = prompt | llm
 
-    print("Streaming response:\n")
+budget = StreamingTokenBudget(max_tokens=50)  # Low limit for testing
 
-    # ✅ MUST use context manager
-    with client.responses.stream(
-        model=MODEL,
-        input=prompt,
-    ) as stream:
-
-        # ✅ Now it's iterable
-        for event in stream:
-            if event.type == "response.output_text.delta":
-                chunk = event.delta
-                full_response += chunk
-                tokens = count_tokens(chunk)
-                total_output_tokens += tokens
-
-                elapsed = time.time() - start_time
-
-                # print(chunk, end="", flush=True)
-                # print(
-                #     f"\n[Tokens so far: {total_output_tokens} | {elapsed:.2f}s]\n",
-                #     end="",
-                #     flush=True,
-                # )
-
-            elif event.type == "response.completed":
-                usage = event.response.usage
-                print("\n=== FINAL USAGE (SERVER) ===")
-                print(f"Input tokens:  {usage.input_tokens}")
-                print(f"Output tokens: {usage.output_tokens}")
-                print(f"Total tokens:  {usage.total_tokens}")
-
-    return full_response
-
-
-if __name__ == "__main__":
-    response = stream_with_live_token_usage(
-        "Explain how Raft consensus works step by step."
+try:
+    result = stream_with_budget(
+        chain, 
+        {"topic": "artificial intelligence"}, 
+        budget
     )
-    print(response)
+except TokenBudgetExceededError:
+    pass
