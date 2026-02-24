@@ -1,0 +1,299 @@
+import os
+import time
+import uuid
+from pathlib import Path
+import typer
+from typing_extensions import Annotated
+import store
+import ui
+from graph import run_graph
+
+app = typer.Typer()
+
+DB_PATH = "~/.agent-runtime-mvp/sessions.db"
+
+
+@app.command()
+def init():
+    """Initialize the agent runtime - create database and check environment."""
+    ui.print_banner()
+    # Check OPENAI_API_KEY
+    if not os.getenv("OPENAI_API_KEY"):
+        ui.print_error("OPENAI_API_KEY environment variable not set")
+        raise typer.Exit(1)
+
+    # Create directory
+    db_path = str(Path(DB_PATH).expanduser())
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Initialize database
+    store.init_db(db_path)
+
+    ui.console.print(f"[{ui.THEME['success']}]✓ Initialized database at {db_path}[/]")
+    ui.console.print(f"[{ui.THEME['success']}]✓ OPENAI_API_KEY found[/]")
+    ui.console.print()
+
+
+@app.command()
+def run(
+    task: Annotated[str, typer.Argument()] = None,
+    session: Annotated[str, typer.Option("--session")] = None,
+    max_tokens: Annotated[int, typer.Option("--max-tokens")] = 100,
+    model: Annotated[str, typer.Option("--model")] = "gpt-4o",
+):
+    """Run an agent task with token budget tracking. Supports continuous conversation mode."""
+    from dotenv import load_dotenv
+    from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
+    from graph import build_graph
+
+    load_dotenv()  # Load .env file
+    ui.print_banner()
+
+    # Check OPENAI_API_KEY
+    if not os.getenv("OPENAI_API_KEY"):
+        ui.print_error("OPENAI_API_KEY environment variable not set. Run 'init' first.")
+        raise typer.Exit(1)
+
+    db_path = str(Path(DB_PATH).expanduser())
+
+    # Resume existing session or create new one
+    if session:
+        # Resume existing session
+        session_data = store.get_session(session, db_path)
+        if not session_data:
+            ui.print_error(f"Session {session} not found")
+            raise typer.Exit(1)
+
+        session_id = session
+        tokens_used_so_far = session_data["tokens_used"]
+        max_tokens = session_data["max_tokens"]
+        original_task = session_data["task"]
+
+        ui.console.print(f"[bold]Resuming session {session_id}[/bold]")
+        ui.console.print(f"[dim]Original task: {original_task}[/dim]")
+        ui.console.print(f"[dim]Budget: {tokens_used_so_far:,} / {max_tokens:,} tokens used[/dim]")
+        ui.console.print()
+    else:
+        # Create new session
+        if not task:
+            ui.print_error("Task required for new session. Use: python main.py run \"your task\"")
+            raise typer.Exit(1)
+
+        session_id = str(uuid.uuid4())[:8]
+        tokens_used_so_far = 0
+        store.create_session(session_id, task, max_tokens, db_path)
+
+        # Print session header
+        ui.print_session_header(session_id, task, model, max_tokens)
+
+    # Track start time
+    start_time = time.time()
+    step_counter = 0
+    current_state = None
+
+    try:
+        # Build graph
+        graph = build_graph(db_path)
+        config = {"configurable": {"thread_id": session_id}}
+
+        # Continuous conversation loop
+        current_tokens = tokens_used_so_far
+        conversation_active = True
+
+        while conversation_active:
+            # Get task for this turn
+            if not task:
+                ui.console.print()
+                remaining = max_tokens - current_tokens
+                ui.console.print(f"[{ui.THEME['dim']}]Remaining budget: {remaining:,} tokens[/]")
+                task = ui.console.input(f"[{ui.THEME['accent']}]Task (or 'quit' to exit): [/]").strip()
+
+                if task.lower() in ['quit', 'exit', 'q', '']:
+                    ui.console.print("[dim]Exiting session...[/dim]")
+                    break
+
+            # Prepare state for this turn
+            turn_state = {
+                "session_id": session_id,
+                "task": task,
+                "messages": [HumanMessage(content=task)],
+                "tool_results": [],
+                "tokens_used": current_tokens,
+                "max_tokens": max_tokens,
+                "status": "running",
+                "summary": None
+            }
+
+            # Stream through graph and display outputs
+            final_state = None
+            turn_start_tokens = current_tokens
+
+            # Show thinking animation at the start
+            ui.console.print()
+            status = ui.console.status(f"[{ui.THEME['llm']}]● Working on it...[/]", spinner="dots")
+            status.start()
+
+            for step in graph.stream(turn_state, config):
+                if isinstance(step, dict):
+                    for node_name, node_state in step.items():
+                        final_state = node_state
+
+                        # Display outputs based on node type
+                        if node_name == "agent":
+                            # Stop thinking spinner
+                            status.stop()
+
+                            # LLM response
+                            if node_state.get("messages"):
+                                last_msg = node_state["messages"][-1]
+                                if isinstance(last_msg, AIMessage):
+                                    step_counter += 1
+                                    content = last_msg.content if last_msg.content else "[Tool calls]"
+                                    # Estimate tokens for this step
+                                    prev_tokens = turn_start_tokens
+                                    tokens_this_step = node_state["tokens_used"] - prev_tokens
+                                    ui.print_step_llm(step_counter, content, tokens_this_step)
+
+                                    # Log to database
+                                    store.log_step(session_id, step_counter, "llm_response", content, tokens_this_step, db_path)
+
+                                    # If agent called tools, show "Executing tools..." status
+                                    if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+                                        status.update(f"[{ui.THEME['tool']}]● Executing tools...[/]")
+                                        status.start()
+
+                        elif node_name == "tools":
+                            # Stop tool execution spinner
+                            status.stop()
+
+                            # Tool execution
+                            if node_state.get("messages"):
+                                # Find tool messages
+                                for msg in reversed(node_state["messages"]):
+                                    if isinstance(msg, ToolMessage):
+                                        step_counter += 1
+                                        tool_name = msg.name if hasattr(msg, 'name') else "tool"
+                                        content = msg.content
+
+                                        # Get tool input from previous AI message
+                                        tool_input = {}
+                                        for prev_msg in reversed(node_state["messages"]):
+                                            if isinstance(prev_msg, AIMessage) and hasattr(prev_msg, 'tool_calls') and prev_msg.tool_calls:
+                                                for tc in prev_msg.tool_calls:
+                                                    if hasattr(msg, 'tool_call_id') and tc.get('id') == msg.tool_call_id:
+                                                        tool_input = tc.get('args', {})
+                                                        tool_name = tc.get('name', tool_name)
+                                                        break
+                                                break
+
+                                        # Estimate tokens
+                                        from budget import count_tokens
+                                        tokens_this_step = count_tokens(content)
+
+                                        ui.print_step_tool(step_counter, tool_name, tool_input, content, tokens_this_step)
+
+                                        # Log to database
+                                        store.log_step(session_id, step_counter, "tool_call", f"{tool_name}: {content[:200]}", tokens_this_step, db_path)
+                                        break  # Only show the latest tool message
+
+                                # After tools, agent will think again
+                                status.update(f"[{ui.THEME['llm']}]● Thinking...[/]")
+                                status.start()
+
+                        elif node_name == "summarize":
+                            # Stop spinner for summarization
+                            status.stop()
+
+                            # Show summarizing notice
+                            if node_state.get("status") == "complete":
+                                ui.print_summarizing()
+
+            # Make sure spinner is stopped at the end
+            try:
+                status.stop()
+            except:
+                pass
+
+            if not final_state:
+                ui.print_error("Graph execution failed - no final state returned")
+                break
+
+            # Update current token count
+            current_tokens = final_state["tokens_used"]
+
+            # Print token bar after this turn
+            ui.print_token_bar(current_tokens, max_tokens)
+
+            # Update session in database
+            store.update_session(
+                session_id,
+                final_state["status"],
+                current_tokens,
+                final_state.get("summary"),
+                db_path,
+            )
+
+            # Check if budget exceeded or summarizing
+            if final_state["status"] == "summarizing" or current_tokens >= max_tokens:
+                ui.console.print()
+                ui.console.print(f"[{ui.THEME['warning']}]⚠ Token budget exhausted ({current_tokens:,} / {max_tokens:,})[/]")
+
+                if final_state.get("summary"):
+                    ui.console.print(f"[{ui.THEME['dim']}]Summary: {final_state['summary']}[/]")
+
+                conversation_active = False
+                break
+
+            # Reset task for next iteration (will prompt user)
+            task = None
+
+        # Calculate elapsed time
+        elapsed = time.time() - start_time
+
+        # Print final session stats
+        ui.console.print()
+        ui.console.print("─" * 80)
+        ui.console.print(f"[bold]Session Complete[/bold] ({elapsed:.1f}s)")
+        ui.console.print(f"[bold]Total Tokens:[/bold] {current_tokens:,} / {max_tokens:,}")
+        ui.console.print(f"[{ui.THEME['dim']}]Session ID: {session_id}[/]")
+        ui.console.print(f"[{ui.THEME['dim']}]Resume: python main.py run --session {session_id}[/]")
+        ui.console.print("─" * 80)
+        ui.console.print()
+
+    except Exception as e:
+        ui.print_error(f"Error during execution: {str(e)}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def sessions():
+    """List all sessions."""
+    db_path = str(Path(DB_PATH).expanduser())
+
+    # Check if database exists
+    if not Path(db_path).exists():
+        ui.print_error("Database not found. Run 'init' first.")
+        raise typer.Exit(1)
+
+    sessions_list = store.list_sessions(db_path)
+    ui.print_sessions_table(sessions_list)
+
+
+@app.command()
+def inspect(session: Annotated[str, typer.Option("--session")]):
+    """Inspect a specific session in detail."""
+    db_path = str(Path(DB_PATH).expanduser())
+
+    # Check if database exists
+    if not Path(db_path).exists():
+        ui.print_error("Database not found. Run 'init' first.")
+        raise typer.Exit(1)
+
+    session_data = store.get_session(session, db_path)
+    steps_data = store.get_steps(session, db_path)
+
+    ui.print_inspect(session_data, steps_data)
+
+
+if __name__ == "__main__":
+    app()

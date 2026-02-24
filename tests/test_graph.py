@@ -1,0 +1,142 @@
+import pytest
+from unittest.mock import patch, MagicMock
+from langchain_core.messages import AIMessage, HumanMessage
+
+from graph import agent_node, budget_gate, summarize_node
+from state import AgentState
+
+
+def test_agent_node_no_tool_calls():
+    """With mocked LLM that returns no tool calls, graph should reach END with status complete."""
+    # Create initial state
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "test task",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "status": "running",
+        "summary": None
+    }
+
+    # Mock LLM response with no tool calls
+    mock_response = AIMessage(content="Task completed successfully")
+
+    with patch('graph.ChatOpenAI') as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        # Run agent node
+        result = agent_node(state)
+
+        # Verify status is still running (not summarizing)
+        assert result["status"] == "running"
+        assert result["tokens_used"] > 0
+
+        # Check budget gate routing
+        gate_result = budget_gate(result)
+        assert gate_result == "end"
+
+
+def test_agent_node_with_tool_calls():
+    """With mocked LLM that returns tool calls, graph routes through tool node."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "list files",
+        "messages": [HumanMessage(content="list files")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "status": "running",
+        "summary": None
+    }
+
+    # Mock LLM response with tool calls
+    mock_response = AIMessage(
+        content="I'll list the files",
+        tool_calls=[{
+            "name": "list_directory",
+            "args": {"path": "."},
+            "id": "call_1"
+        }]
+    )
+
+    with patch('graph.ChatOpenAI') as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        # Run agent node
+        result = agent_node(state)
+
+        # Check budget gate routing
+        gate_result = budget_gate(result)
+        assert gate_result == "tools"
+
+
+def test_budget_exceeded_triggers_summarize():
+    """With token budget set to 1, graph routes to summarize node."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "test task",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 1,  # Very low budget
+        "status": "running",
+        "summary": None
+    }
+
+    # Mock LLM response
+    mock_response = AIMessage(content="This response will exceed the budget")
+
+    with patch('graph.ChatOpenAI') as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        # Run agent node
+        result = agent_node(state)
+
+        # Status should be summarizing
+        assert result["status"] == "summarizing"
+        assert result["tokens_used"] >= result["max_tokens"]
+
+        # Check budget gate routing
+        gate_result = budget_gate(result)
+        assert gate_result == "summarize"
+
+
+def test_summarize_node_completes():
+    """Summarize node sets status to complete with a summary."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "test task",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [
+            {"content": "tool result 1", "tokens": 10},
+            {"content": "tool result 2", "tokens": 10}
+        ],
+        "tokens_used": 100,
+        "max_tokens": 50,
+        "status": "summarizing",
+        "summary": None
+    }
+
+    # Mock LLM response for summary
+    mock_summary = AIMessage(content="Task summary: completed some work")
+
+    with patch('graph.ChatOpenAI') as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = mock_summary
+        mock_llm_class.return_value = mock_llm
+
+        # Run summarize node
+        result = summarize_node(state)
+
+        # Status should be complete
+        assert result["status"] == "complete"
+        assert result["summary"] is not None
+        assert len(result["summary"]) > 0
