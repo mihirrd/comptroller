@@ -7,17 +7,40 @@ from typing_extensions import Annotated
 from graph import summarize_node
 import store
 import ui
-from graph import run_graph
+from dotenv import load_dotenv
 
 app = typer.Typer()
 
 DB_PATH = "~/.agent-runtime-mvp/sessions.db"
 
+@app.command()
+def clear_sessions():
+    """Utility function to clear all sessions from the database."""
+    db_path = str(Path(DB_PATH).expanduser())
+    if Path(db_path).exists():
+        os.remove(db_path)
+        print("All sessions cleared.")
+    else:
+        print("No database found to clear.")
+    
+@app.command()
+def list():
+    """List all sessions."""
+    db_path = str(Path(DB_PATH).expanduser())
+
+    # Check if database exists
+    if not Path(db_path).exists():
+        ui.print_error("Database not found. Run 'init' first.")
+        raise typer.Exit(1)
+
+    sessions_list = store.list_sessions(db_path)
+    ui.print_sessions_table(sessions_list)
 
 @app.command()
 def init():
     """Initialize the agent runtime - create database and check environment."""
     ui.print_banner()
+    load_dotenv()
     # Check OPENAI_API_KEY
     if not os.getenv("OPENAI_API_KEY"):
         ui.print_error("OPENAI_API_KEY environment variable not set")
