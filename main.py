@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 import typer
 from typing_extensions import Annotated
+from graph import summarize_node
 import store
 import ui
 from graph import run_graph
@@ -42,7 +43,6 @@ def run(
     model: Annotated[str, typer.Option("--model")] = "gpt-4o",
 ):
     """Run an agent task with token budget tracking. Supports continuous conversation mode."""
-    from dotenv import load_dotenv
     from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
     from graph import build_graph
 
@@ -67,6 +67,11 @@ def run(
         session_id = session
         tokens_used_so_far = session_data["tokens_used"]
         max_tokens = session_data["max_tokens"]
+
+        if tokens_used_so_far >= max_tokens:
+            ui.print_error(f"Session {session_id} has exceeded token budget of {max_tokens:,}")
+            ui.console.print("[dim]Please reset the session")
+            raise typer.Exit(1)
         original_task = session_data["task"]
 
         ui.console.print(f"[bold]Resuming session {session_id}[/bold]")
@@ -89,7 +94,6 @@ def run(
     # Track start time
     start_time = time.time()
     step_counter = 0
-    current_state = None
 
     try:
         # Build graph
@@ -133,9 +137,32 @@ def run(
             status = ui.console.status(f"[{ui.THEME['llm']}]● Working on it...[/]", spinner="dots")
             status.start()
 
-            for step in graph.stream(turn_state, config):
-                if isinstance(step, dict):
-                    for node_name, node_state in step.items():
+            token_count = 0
+            ai_message = ""
+            budget_exhausted = False
+            for chunk in graph.stream(turn_state, config, stream_mode=["messages", "updates"]):
+                mode, data = chunk
+                if mode == "messages":
+                    message_chunk, metadata = data
+                    node = metadata.get("langgraph_node")
+
+                    # Stream text tokens live from agent node only
+                    if node == "agent" and message_chunk.content:
+                        ai_message += message_chunk.content
+                        print(message_chunk.content, end="")
+                        token_count += 1
+                    
+                    if token_count >= 50:
+                        # Stop spinner after receiving some tokens
+                        status.stop()
+                        budget_exhausted = True
+                        break
+                
+                elif mode == "updates":
+                    if not isinstance(data, dict):
+                        continue
+                    
+                    for node_name, node_state in data.items():
                         final_state = node_state
 
                         # Display outputs based on node type
@@ -200,7 +227,7 @@ def run(
                                 status.update(f"[{ui.THEME['llm']}]● Thinking...[/]")
                                 status.start()
 
-                        elif node_name == "summarize":
+                        if node_name == "summarize":
                             # Stop spinner for summarization
                             status.stop()
 
@@ -213,6 +240,20 @@ def run(
                 status.stop()
             except:
                 pass
+
+            if budget_exhausted:                
+                partial_state = {
+                    **turn_state,
+                    "messages": turn_state["messages"] + [AIMessage(content=ai_message)],
+                    "tokens_used": current_tokens + token_count,
+                    "status": "summarizing"
+                }
+                summary_result = summarize_node(partial_state)
+                status.stop()
+                final_state = summary_result
+                current_tokens = partial_state["tokens_used"]
+                ui.print_token_bar(current_tokens, max_tokens)
+                conversation_active = False
 
             if not final_state:
                 ui.print_error("Graph execution failed - no final state returned")
