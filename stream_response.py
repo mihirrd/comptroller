@@ -34,9 +34,10 @@ def stream_with_budget(chain, input_data, budget):
         print(f"\n\n❌ HALTED: {e}")
         return result
 
-
-llm = ChatOllama(model="llama3")
-
+llm = ChatOllama(
+    model="llama3",
+    base_url="http://localhost:11434"
+)
 prompt = ChatPromptTemplate.from_template(
     "Write a long essay about: {topic}"
 )
