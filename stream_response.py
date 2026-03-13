@@ -1,4 +1,4 @@
-from langchain_openai import ChatOpenAI
+from langchain_community.chat_models import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 
@@ -20,12 +20,11 @@ class TokenBudgetExceededError(Exception):
     pass
 
 def stream_with_budget(chain, input_data, budget: StreamingTokenBudget):
-    """Stream response and halt if budget exceeded"""
     result = ""
     try:
         for chunk in chain.stream(input_data):
             chunk_text = chunk.content if hasattr(chunk, 'content') else str(chunk)
-            chunk_tokens = len(chunk_text.split()) * 1.3  # Rough estimate
+            chunk_tokens = len(chunk_text.split()) * 1.3
             
             budget.check_and_increment(int(chunk_tokens))
             result += chunk_text
@@ -36,17 +35,21 @@ def stream_with_budget(chain, input_data, budget: StreamingTokenBudget):
         print(f"\n\n❌ HALTED: {e}")
         return result
 
-# Usage
-llm = ChatOpenAI(streaming=True)
+
+llm = ChatOllama(
+    model="llama3",
+    streaming=True
+)
+
 prompt = ChatPromptTemplate.from_template("Write a long essay about: {topic}")
 chain = prompt | llm
 
-budget = StreamingTokenBudget(max_tokens=50)  # Low limit for testing
+budget = StreamingTokenBudget(max_tokens=50)
 
 try:
     result = stream_with_budget(
-        chain, 
-        {"topic": "artificial intelligence"}, 
+        chain,
+        {"topic": "artificial intelligence"},
         budget
     )
 except TokenBudgetExceededError:
