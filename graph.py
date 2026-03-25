@@ -1,6 +1,9 @@
+import logging
 import os
 import sqlite3
 from pathlib import Path
+from typing import Any
+
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt import ToolNode
@@ -10,6 +13,39 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from state import AgentState
 from tools import TOOLS
 from budget import count_tokens
+
+logger = logging.getLogger(__name__)
+
+
+def _truncate(s: str, max_len: int = 6000) -> str:
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + f"... <truncated {len(s) - max_len} chars>"
+
+
+def _format_message_for_log(i: int, msg: Any) -> str:
+    typ = type(msg).__name__
+    content = getattr(msg, "content", "")
+    if isinstance(content, list):
+        body = _truncate(str(content), 4000)
+    else:
+        body = _truncate(str(content or ""), 4000)
+    lines = [f"  [{i}] {typ}: {body}"]
+    if getattr(msg, "tool_calls", None):
+        lines.append(f"       tool_calls: {_truncate(str(msg.tool_calls), 2000)}")
+    ak = getattr(msg, "additional_kwargs", None) or {}
+    if ak:
+        lines.append(f"       additional_kwargs keys: {list(ak.keys())}")
+    return "\n".join(lines)
+
+
+def _format_messages_for_log(messages: list[Any]) -> str:
+    return "\n".join(_format_message_for_log(i, m) for i, m in enumerate(messages))
+
+
+def _format_ai_response_for_log(response: Any) -> str:
+    lines = [_format_message_for_log(0, response)]
+    return "\n".join(lines)
 
 
 def _chat(model: str, temperature: float = 0) -> ChatLiteLLM:
@@ -31,8 +67,19 @@ def agent_node(state: AgentState) -> AgentState:
     llm = _chat(state["model"])
     llm_with_tools = llm.bind_tools(TOOLS)
 
+    logger.info(
+        "LLM request session_id=%s model=%s n_messages=%s",
+        state["session_id"],
+        state["model"],
+        len(messages),
+    )
+    logger.info("LLM request messages:\n%s", _format_messages_for_log(messages))
+
     # Call LLM
     response = llm_with_tools.invoke(messages)
+
+    logger.info("LLM response session_id=%s", state["session_id"])
+    logger.info("LLM response:\n%s", _format_ai_response_for_log(response))
 
     # Count tokens in response
     response_text = response.content if hasattr(response, 'content') else str(response)
@@ -57,6 +104,14 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
 
     # Execute tools (this only returns updated messages)
     tool_result = tool_executor.invoke(state)
+
+    logger.info(
+        "Tool execution session_id=%s new_messages appended:\n%s",
+        state["session_id"],
+        _format_messages_for_log(
+            [m for m in tool_result["messages"] if m not in state["messages"]]
+        ),
+    )
 
     # Start with a copy of the original state to preserve all fields
     new_state = state.copy()
@@ -118,13 +173,26 @@ def summarize_node(state: AgentState) -> AgentState:
 Tool calls made:
 {tool_results_text if tool_results_text else 'No tools were called'}
 
-Please provide a brief summary of what was accomplished and what remains to be done."""
+    Please provide a brief summary of what was accomplished and what remains to be done."""
+
+    logger.info(
+        "Summarize request session_id=%s model=%s",
+        state["session_id"],
+        state["model"],
+    )
+    logger.info("Summarize prompt:\n%s", _truncate(summary_prompt, 8000))
 
     # Call LLM for summary (does not check budget)
     llm = _chat(state["model"])
     response = llm.invoke([HumanMessage(content=summary_prompt)])
 
     summary = response.content if hasattr(response, 'content') else str(response)
+
+    logger.info(
+        "Summarize response session_id=%s summary=%s",
+        state["session_id"],
+        _truncate(str(summary), 4000),
+    )
 
     # Update state
     new_state = state.copy()

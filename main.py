@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 import uuid
@@ -5,9 +6,19 @@ from pathlib import Path
 import typer
 from typing_extensions import Annotated
 from graph import summarize_node
+import logging_config
 import store
 import ui
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
+
+
+def _log_repr_preview(obj: object, max_len: int = 2000) -> str:
+    s = repr(obj)
+    if len(s) > max_len:
+        return s[:max_len] + f"... <truncated {len(s) - max_len} chars>"
+    return s
 
 
 def _available_llm_models() -> list[str]:
@@ -31,8 +42,8 @@ def clear_sessions():
     else:
         print("No database found to clear.")
     
-@app.command()
-def list():
+@app.command(name="list")
+def list_sessions_cmd():
     """List all sessions."""
     db_path = str(Path(DB_PATH).expanduser())
 
@@ -47,10 +58,12 @@ def list():
 @app.command()
 def init():
     """Initialize the agent runtime - create database and check environment."""
+    logging_config.configure_logging()
     ui.print_banner()
     load_dotenv()
 
     valid_models = _available_llm_models()
+    logging_config.detach_console_handlers()
     if not valid_models:
         ui.print_error(
             "No LLM provider API keys detected. Set credentials for at least one provider "
@@ -87,6 +100,7 @@ def run(
     from graph import build_graph
 
     load_dotenv()  # Load .env file
+    logging_config.configure_logging()
     ui.print_banner()
 
     if not _available_llm_models():
@@ -95,6 +109,8 @@ def run(
             "(e.g. OPENAI_API_KEY, ANTHROPIC_API_KEY)."
         )
         raise typer.Exit(1)
+
+    logging_config.detach_console_handlers()
 
     db_path = str(Path(DB_PATH).expanduser())
 
@@ -180,31 +196,55 @@ def run(
             status = ui.console.status(f"[{ui.THEME['llm']}]● Working on it...[/]", spinner="dots")
             status.start()
 
+            logger.info(
+                "Graph stream start session_id=%s model=%s tokens_used=%s max_tokens=%s task=%r",
+                session_id,
+                model,
+                current_tokens,
+                max_tokens,
+                task,
+            )
+            logger.info(
+                "Initial messages for this turn (before system prompt in graph): %s",
+                _log_repr_preview(turn_state["messages"][0]),
+            )
+
             token_count = 0
             ai_message = ""
             budget_exhausted = False
+            # Some deps add console handlers on first use; strip again before LLM/tool work.
+            logging_config.detach_console_handlers()
             for chunk in graph.stream(turn_state, config, stream_mode=["messages", "updates"]):
                 mode, data = chunk
+                logger.debug("stream chunk mode=%s", mode)
                 if mode == "messages":
                     message_chunk, metadata = data
                     node = metadata.get("langgraph_node")
+                    logger.debug(
+                        "stream messages langgraph_node=%s chunk=%s",
+                        node,
+                        _log_repr_preview(message_chunk),
+                    )
 
                     # Stream text tokens live from agent node only
                     if node == "agent" and message_chunk.content:
                         ai_message += message_chunk.content
-                        print(message_chunk.content, end="")
+                        # print(message_chunk.content, end="")
                         token_count += 1
                     
-                    if token_count >= 50:
+                    if token_count >= 5:
                         # Stop spinner after receiving some tokens
                         status.stop()
-                        budget_exhausted = True
-                        break
                 
                 elif mode == "updates":
                     if not isinstance(data, dict):
+                        logger.debug(
+                            "stream updates non-dict payload: %s",
+                            _log_repr_preview(data),
+                        )
                         continue
-                    
+                    logger.debug("stream updates node keys: %s", list(data.keys()))
+
                     for node_name, node_state in data.items():
                         final_state = node_state
 
