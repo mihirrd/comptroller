@@ -96,6 +96,7 @@ def run(
 ):
     """Run an agent task with token budget tracking. Supports continuous conversation mode."""
     from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
+    from budget import tokens_from_llm_message
     from graph import build_graph
 
     load_dotenv()  # Load .env file
@@ -186,8 +187,6 @@ def run(
 
             # Stream through graph and display outputs
             final_state = None
-            turn_start_tokens = current_tokens
-
             # Show thinking animation at the start
             ui.console.print()
             status = ui.console.status(f"[{ui.THEME['llm']}]● Working on it...[/]", spinner="dots")
@@ -254,9 +253,7 @@ def run(
                                 if isinstance(last_msg, AIMessage):
                                     step_counter += 1
                                     content = last_msg.content if last_msg.content else "[Tool calls]"
-                                    # Estimate tokens for this step
-                                    prev_tokens = turn_start_tokens
-                                    tokens_this_step = node_state["tokens_used"] - prev_tokens
+                                    tokens_this_step = tokens_from_llm_message(last_msg, model)
                                     ui.print_step_llm(step_counter, content, tokens_this_step)
 
                                     # Log to database

@@ -12,7 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from state import AgentState
 from tools import TOOLS
-from budget import count_tokens
+from budget import count_tokens, tokens_from_llm_message
 
 logger = logging.getLogger(__name__)
 
@@ -81,14 +81,21 @@ def agent_node(state: AgentState) -> AgentState:
     logger.info("LLM response session_id=%s", state["session_id"])
     logger.info("LLM response:\n%s", _format_ai_response_for_log(response))
 
-    # Count tokens in response
-    response_text = response.content if hasattr(response, 'content') else str(response)
-    tokens = count_tokens(response_text)
+    tokens = tokens_from_llm_message(response, state["model"])
 
     # Update state
     new_state = state.copy()
     new_state["tokens_used"] = state["tokens_used"] + tokens
     new_state["messages"] = state["messages"] + [response]
+
+    logger.info(
+        "LLM exchange session_id=%s model=%s tokens_this_call=%s tokens_used_total=%s max_tokens=%s",
+        state["session_id"],
+        state["model"],
+        tokens,
+        new_state["tokens_used"],
+        state["max_tokens"],
+    )
 
     # Check if budget exceeded
     if new_state["tokens_used"] >= state["max_tokens"]:
@@ -199,6 +206,8 @@ Tool calls made:
 
     summary = response.content if hasattr(response, 'content') else str(response)
 
+    summary_tokens = tokens_from_llm_message(response, state["model"])
+
     logger.info(
         "Summarize response session_id=%s summary=%s",
         state["session_id"],
@@ -209,6 +218,15 @@ Tool calls made:
     new_state = state.copy()
     new_state["status"] = "complete"
     new_state["summary"] = summary
+    new_state["tokens_used"] = state["tokens_used"] + summary_tokens
+
+    logger.info(
+        "Summarize LLM exchange session_id=%s model=%s tokens_this_call=%s tokens_used_total=%s",
+        state["session_id"],
+        state["model"],
+        summary_tokens,
+        new_state["tokens_used"],
+    )
 
     return new_state
 
