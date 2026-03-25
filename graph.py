@@ -146,7 +146,7 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
 
 
 def budget_gate(state: AgentState) -> str:
-    """Budget gate - decides next step based on state."""
+    """Route from agent node: tools, summarize, or end."""
     if state["status"] == "summarizing":
         return "summarize"
 
@@ -158,6 +158,17 @@ def budget_gate(state: AgentState) -> str:
         return "tools"
 
     return "end"
+
+
+def after_tools_gate(state: AgentState) -> str:
+    """Route from tools node: model must run again to consume tool results; do not use budget_gate here.
+
+    After ToolNode, the last message is a ToolMessage (no tool_calls), so reusing budget_gate would
+    incorrectly return \"end\" and terminate before the agent reads tool output.
+    """
+    if state["status"] == "summarizing":
+        return "summarize"
+    return "continue"
 
 
 def summarize_node(state: AgentState) -> AgentState:
@@ -233,15 +244,14 @@ def build_graph(db_path: str = "~/.agent-runtime-mvp/sessions.db"):
         }
     )
 
-    # From tools, go through budget gate
+    # From tools: always return to agent unless budget requires summarization
     workflow.add_conditional_edges(
         "tools",
-        budget_gate,
+        after_tools_gate,
         {
-            "tools": "agent",  # Loop back to agent
+            "continue": "agent",
             "summarize": "summarize",
-            "end": END
-        }
+        },
     )
 
     # Summarize always goes to END

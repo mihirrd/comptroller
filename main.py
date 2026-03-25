@@ -63,7 +63,6 @@ def init():
     load_dotenv()
 
     valid_models = _available_llm_models()
-    logging_config.detach_console_handlers()
     if not valid_models:
         ui.print_error(
             "No LLM provider API keys detected. Set credentials for at least one provider "
@@ -109,8 +108,6 @@ def run(
             "(e.g. OPENAI_API_KEY, ANTHROPIC_API_KEY)."
         )
         raise typer.Exit(1)
-
-    logging_config.detach_console_handlers()
 
     db_path = str(Path(DB_PATH).expanduser())
 
@@ -212,8 +209,6 @@ def run(
             token_count = 0
             ai_message = ""
             budget_exhausted = False
-            # Some deps add console handlers on first use; strip again before LLM/tool work.
-            logging_config.detach_console_handlers()
             for chunk in graph.stream(turn_state, config, stream_mode=["messages", "updates"]):
                 mode, data = chunk
                 logger.debug("stream chunk mode=%s", mode)

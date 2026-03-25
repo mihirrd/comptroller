@@ -1,8 +1,8 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from graph import agent_node, budget_gate, summarize_node
+from graph import after_tools_gate, agent_node, budget_gate, summarize_node
 from state import AgentState
 
 
@@ -76,6 +76,47 @@ def test_agent_node_with_tool_calls():
         # Check budget gate routing
         gate_result = budget_gate(result)
         assert gate_result == "tools"
+
+
+def test_after_tools_gate_routes_to_continue_not_end():
+    """After tools, last message is ToolMessage — must loop to agent, not END (regression)."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "t",
+        "model": "gpt-4o",
+        "messages": [
+            HumanMessage(content="hi"),
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "list_directory", "args": {"path": "."}, "id": "1"}],
+            ),
+            ToolMessage(content="ok", tool_call_id="1"),
+        ],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "status": "running",
+        "summary": None,
+    }
+    assert after_tools_gate(state) == "continue"
+    # budget_gate would wrongly return "end" here — do not use it after tools
+    assert budget_gate(state) == "end"
+
+
+def test_after_tools_gate_respects_summarizing():
+    """When budget hit during tools, route to summarize instead of agent."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "t",
+        "model": "gpt-4o",
+        "messages": [HumanMessage(content="x")],
+        "tool_results": [],
+        "tokens_used": 100,
+        "max_tokens": 50,
+        "status": "summarizing",
+        "summary": None,
+    }
+    assert after_tools_gate(state) == "summarize"
 
 
 def test_budget_exceeded_triggers_summarize():
