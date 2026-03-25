@@ -9,6 +9,14 @@ import store
 import ui
 from dotenv import load_dotenv
 
+
+def _available_llm_models() -> list[str]:
+    """Models LiteLLM can use with the current environment (provider keys from .env)."""
+    from litellm.utils import get_valid_models
+
+    return sorted(get_valid_models())
+
+
 app = typer.Typer()
 
 DB_PATH = "~/.agent-runtime-mvp/sessions.db"
@@ -41,9 +49,14 @@ def init():
     """Initialize the agent runtime - create database and check environment."""
     ui.print_banner()
     load_dotenv()
-    # Check OPENAI_API_KEY
-    if not os.getenv("OPENAI_API_KEY"):
-        ui.print_error("OPENAI_API_KEY environment variable not set")
+
+    valid_models = _available_llm_models()
+    if not valid_models:
+        ui.print_error(
+            "No LLM provider API keys detected. Set credentials for at least one provider "
+            "(e.g. OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GROQ_API_KEY). "
+            "See LiteLLM provider docs for env variable names."
+        )
         raise typer.Exit(1)
 
     # Create directory
@@ -54,8 +67,12 @@ def init():
     store.init_db(db_path)
 
     ui.console.print(f"[{ui.THEME['success']}]✓ Initialized database at {db_path}[/]")
-    ui.console.print(f"[{ui.THEME['success']}]✓ OPENAI_API_KEY found[/]")
+    ui.console.print(
+        f"[{ui.THEME['success']}]✓ LLM credentials detected "
+        f"([{ui.THEME['accent']}]{len(valid_models):,}[/{ui.THEME['accent']}] models available)[/]"
+    )
     ui.console.print()
+    ui.print_available_models(valid_models)
 
 
 @app.command()
@@ -72,9 +89,11 @@ def run(
     load_dotenv()  # Load .env file
     ui.print_banner()
 
-    # Check OPENAI_API_KEY
-    if not os.getenv("OPENAI_API_KEY"):
-        ui.print_error("OPENAI_API_KEY environment variable not set. Run 'init' first.")
+    if not _available_llm_models():
+        ui.print_error(
+            "No LLM provider API keys detected. Run 'init' and configure credentials "
+            "(e.g. OPENAI_API_KEY, ANTHROPIC_API_KEY)."
+        )
         raise typer.Exit(1)
 
     db_path = str(Path(DB_PATH).expanduser())
@@ -143,6 +162,7 @@ def run(
             turn_state = {
                 "session_id": session_id,
                 "task": task,
+                "model": model,
                 "messages": [HumanMessage(content=task)],
                 "tool_results": [],
                 "tokens_used": current_tokens,

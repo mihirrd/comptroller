@@ -12,6 +12,7 @@ def test_agent_node_no_tool_calls():
     state: AgentState = {
         "session_id": "test-123",
         "task": "test task",
+        "model": "gpt-4o",
         "messages": [HumanMessage(content="test task")],
         "tool_results": [],
         "tokens_used": 0,
@@ -23,7 +24,7 @@ def test_agent_node_no_tool_calls():
     # Mock LLM response with no tool calls
     mock_response = AIMessage(content="Task completed successfully")
 
-    with patch('graph.ChatOpenAI') as mock_llm_class:
+    with patch('graph.ChatLiteLLM') as mock_llm_class:
         mock_llm = MagicMock()
         mock_llm.bind_tools.return_value.invoke.return_value = mock_response
         mock_llm_class.return_value = mock_llm
@@ -45,6 +46,7 @@ def test_agent_node_with_tool_calls():
     state: AgentState = {
         "session_id": "test-123",
         "task": "list files",
+        "model": "gpt-4o",
         "messages": [HumanMessage(content="list files")],
         "tool_results": [],
         "tokens_used": 0,
@@ -63,7 +65,7 @@ def test_agent_node_with_tool_calls():
         }]
     )
 
-    with patch('graph.ChatOpenAI') as mock_llm_class:
+    with patch('graph.ChatLiteLLM') as mock_llm_class:
         mock_llm = MagicMock()
         mock_llm.bind_tools.return_value.invoke.return_value = mock_response
         mock_llm_class.return_value = mock_llm
@@ -81,6 +83,7 @@ def test_budget_exceeded_triggers_summarize():
     state: AgentState = {
         "session_id": "test-123",
         "task": "test task",
+        "model": "gpt-4o",
         "messages": [HumanMessage(content="test task")],
         "tool_results": [],
         "tokens_used": 0,
@@ -92,7 +95,7 @@ def test_budget_exceeded_triggers_summarize():
     # Mock LLM response
     mock_response = AIMessage(content="This response will exceed the budget")
 
-    with patch('graph.ChatOpenAI') as mock_llm_class:
+    with patch('graph.ChatLiteLLM') as mock_llm_class:
         mock_llm = MagicMock()
         mock_llm.bind_tools.return_value.invoke.return_value = mock_response
         mock_llm_class.return_value = mock_llm
@@ -114,6 +117,7 @@ def test_summarize_node_completes():
     state: AgentState = {
         "session_id": "test-123",
         "task": "test task",
+        "model": "gpt-4o",
         "messages": [HumanMessage(content="test task")],
         "tool_results": [
             {"content": "tool result 1", "tokens": 10},
@@ -128,7 +132,7 @@ def test_summarize_node_completes():
     # Mock LLM response for summary
     mock_summary = AIMessage(content="Task summary: completed some work")
 
-    with patch('graph.ChatOpenAI') as mock_llm_class:
+    with patch('graph.ChatLiteLLM') as mock_llm_class:
         mock_llm = MagicMock()
         mock_llm.invoke.return_value = mock_summary
         mock_llm_class.return_value = mock_llm

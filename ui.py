@@ -219,3 +219,28 @@ def print_error(message: str):
         border_style=THEME["error"]
     ))
     console.print()
+
+
+def print_available_models(models: list[str], max_rows: int = 60) -> None:
+    """Print models available given current credentials (LiteLLM get_valid_models)."""
+    if not models:
+        console.print(f"[{THEME['dim']}]No models listed (no provider credentials detected).[/]")
+        console.print()
+        return
+
+    total = len(models)
+    shown = models[:max_rows]
+    overflow = total - len(shown)
+
+    table = Table(title="Available models (from your credentials)")
+    table.add_column("Model", style="cyan")
+
+    for name in shown:
+        table.add_row(name)
+
+    console.print(table)
+    if overflow > 0:
+        console.print(
+            f"[{THEME['dim']}]… and {overflow:,} more (see LiteLLM docs for full model ids).[/]"
+        )
+    console.print()

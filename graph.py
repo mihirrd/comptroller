@@ -4,12 +4,17 @@ from pathlib import Path
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt import ToolNode
-from langchain_openai import ChatOpenAI
+from langchain_litellm import ChatLiteLLM
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from state import AgentState
 from tools import TOOLS
 from budget import count_tokens
+
+
+def _chat(model: str, temperature: float = 0) -> ChatLiteLLM:
+    """LiteLLM-backed chat model; `model` uses LiteLLM naming (provider prefixes optional)."""
+    return ChatLiteLLM(model=model, temperature=temperature)
 
 
 def agent_node(state: AgentState) -> AgentState:
@@ -23,7 +28,7 @@ def agent_node(state: AgentState) -> AgentState:
         messages.insert(0, system_msg)
 
     # Initialize LLM with tools
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = _chat(state["model"])
     llm_with_tools = llm.bind_tools(TOOLS)
 
     # Call LLM
@@ -116,7 +121,7 @@ Tool calls made:
 Please provide a brief summary of what was accomplished and what remains to be done."""
 
     # Call LLM for summary (does not check budget)
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = _chat(state["model"])
     response = llm.invoke([HumanMessage(content=summary_prompt)])
 
     summary = response.content if hasattr(response, 'content') else str(response)
@@ -178,7 +183,13 @@ def build_graph(db_path: str = "~/.agent-runtime-mvp/sessions.db"):
     return workflow.compile(checkpointer=checkpointer)
 
 
-def run_graph(task: str, max_tokens: int, session_id: str, db_path: str = "~/.agent-runtime-mvp/sessions.db"):
+def run_graph(
+    task: str,
+    max_tokens: int,
+    session_id: str,
+    model: str = "gpt-4o",
+    db_path: str = "~/.agent-runtime-mvp/sessions.db",
+):
     """Run the graph and return final state."""
     graph = build_graph(db_path)
 
@@ -186,6 +197,7 @@ def run_graph(task: str, max_tokens: int, session_id: str, db_path: str = "~/.ag
     initial_state: AgentState = {
         "session_id": session_id,
         "task": task,
+        "model": model,
         "messages": [HumanMessage(content=task)],
         "tool_results": [],
         "tokens_used": 0,
