@@ -1,8 +1,19 @@
+import tempfile
+from pathlib import Path
+
 import pytest
 from unittest.mock import patch, MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from graph import after_tools_gate, agent_node, budget_gate, summarize_node
+from graph import (
+    MAX_TOOL_MSG_CHARS,
+    _prepare_messages_for_llm,
+    after_tools_gate,
+    agent_node,
+    budget_gate,
+    summarize_node,
+    tool_node_wrapper,
+)
 from state import AgentState
 
 
@@ -13,6 +24,7 @@ def test_agent_node_no_tool_calls():
         "session_id": "test-123",
         "task": "test task",
         "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
         "messages": [HumanMessage(content="test task")],
         "tool_results": [],
         "tokens_used": 0,
@@ -47,6 +59,7 @@ def test_agent_node_with_tool_calls():
         "session_id": "test-123",
         "task": "list files",
         "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
         "messages": [HumanMessage(content="list files")],
         "tool_results": [],
         "tokens_used": 0,
@@ -84,6 +97,7 @@ def test_after_tools_gate_routes_to_continue_not_end():
         "session_id": "test-123",
         "task": "t",
         "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
         "messages": [
             HumanMessage(content="hi"),
             AIMessage(
@@ -109,6 +123,7 @@ def test_after_tools_gate_respects_summarizing():
         "session_id": "test-123",
         "task": "t",
         "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
         "messages": [HumanMessage(content="x")],
         "tool_results": [],
         "tokens_used": 100,
@@ -125,6 +140,7 @@ def test_budget_exceeded_triggers_summarize():
         "session_id": "test-123",
         "task": "test task",
         "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
         "messages": [HumanMessage(content="test task")],
         "tool_results": [],
         "tokens_used": 0,
@@ -159,6 +175,7 @@ def test_summarize_node_completes():
         "session_id": "test-123",
         "task": "test task",
         "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
         "messages": [HumanMessage(content="test task")],
         "tool_results": [
             {"content": "tool result 1", "tokens": 10},
@@ -185,3 +202,58 @@ def test_summarize_node_completes():
         assert result["status"] == "complete"
         assert result["summary"] is not None
         assert len(result["summary"]) > 0
+
+
+def test_tool_node_tracks_recent_files():
+    """After read_file, resolved path appears in recent_files."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as f:
+        f.write(b"hi")
+        raw_path = f.name
+    try:
+        resolved = str(Path(raw_path).resolve())
+        state: AgentState = {
+            "session_id": "test-123",
+            "task": "read a file",
+            "model": "gpt-4o",
+            "workspace_root": "/tmp/test-ws",
+            "messages": [
+                HumanMessage(content="read"),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "read_file", "args": {"path": raw_path}, "id": "c1"},
+                    ],
+                ),
+            ],
+            "tool_results": [],
+            "tokens_used": 0,
+            "max_tokens": 5000,
+            "status": "running",
+            "summary": None,
+        }
+        tool_msg = ToolMessage(
+            content="[1 lines]\nhi",
+            tool_call_id="c1",
+            name="read_file",
+        )
+        merged = state["messages"] + [tool_msg]
+        mock_exec = MagicMock()
+        mock_exec.invoke.return_value = {"messages": merged}
+
+        with patch("graph.ToolNode", return_value=mock_exec):
+            out = tool_node_wrapper(state)
+
+        assert resolved in out["recent_files"]
+    finally:
+        Path(raw_path).unlink(missing_ok=True)
+
+
+def test_prepare_messages_truncates_long_tool_output():
+    """Very long ToolMessage content is trimmed only in the copy passed to the LLM."""
+    long_body = "x" * (MAX_TOOL_MSG_CHARS + 500)
+    tm = ToolMessage(content=long_body, tool_call_id="t1", name="read_file")
+    msgs = [HumanMessage(content="h"), tm]
+    out = _prepare_messages_for_llm(msgs)
+    assert isinstance(out[1], ToolMessage)
+    assert len(out[1].content) < len(long_body)
+    assert "truncated" in out[1].content

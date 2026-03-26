@@ -177,6 +177,7 @@ def run(
                 "session_id": session_id,
                 "task": task,
                 "model": model,
+                "workspace_root": str(Path.cwd()),
                 "messages": [HumanMessage(content=task)],
                 "tool_results": [],
                 "tokens_used": current_tokens,

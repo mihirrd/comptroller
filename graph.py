@@ -1,5 +1,4 @@
 import logging
-import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -8,13 +7,18 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt import ToolNode
 from langchain_litellm import ChatLiteLLM
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from state import AgentState
 from tools import TOOLS
 from budget import count_tokens, tokens_from_llm_message
+from prompt_builder import build_system_prompt
 
 logger = logging.getLogger(__name__)
+
+MAX_RECENT_FILES = 20
+MAX_TOOL_MSG_CHARS = 12_000
+MAX_TOOL_DIGEST_ITEMS = 8
 
 
 def _truncate(s: str, max_len: int = 6000) -> str:
@@ -53,15 +57,111 @@ def _chat(model: str, temperature: float = 0) -> ChatLiteLLM:
     return ChatLiteLLM(model=model, temperature=temperature)
 
 
+def _merge_recent_files(existing: list[str] | None, new_paths: list[str]) -> list[str]:
+    """Keep order by recency (last touch wins); cap length."""
+    combined = list(existing or [])
+    for p in new_paths:
+        if p in combined:
+            combined.remove(p)
+        combined.append(p)
+    return combined[-MAX_RECENT_FILES:]
+
+
+def _find_tool_call(msgs: list[Any], tool_call_id: str) -> tuple[str | None, dict[str, Any]]:
+    for msg in reversed(msgs):
+        if not isinstance(msg, AIMessage):
+            continue
+        tcs = getattr(msg, "tool_calls", None) or []
+        for tc in tcs:
+            if tc.get("id") == tool_call_id:
+                args = tc.get("args") or {}
+                if not isinstance(args, dict):
+                    args = {}
+                return tc.get("name"), args
+    return None, {}
+
+
+def _paths_from_tool_messages(msgs: list[Any], tool_messages: list[ToolMessage]) -> list[str]:
+    paths: list[str] = []
+    for tm in tool_messages:
+        tid = getattr(tm, "tool_call_id", None)
+        if not tid:
+            continue
+        name, args = _find_tool_call(msgs, tid)
+        if name not in ("read_file", "write_file"):
+            continue
+        raw = args.get("path")
+        if not raw:
+            continue
+        try:
+            paths.append(str(Path(raw).expanduser().resolve()))
+        except Exception:
+            paths.append(str(raw))
+    return paths
+
+
+def _compact_tool_digest(msgs: list[Any]) -> str:
+    """Short bullet list of recent tool calls + result preview (for system prompt only)."""
+    lines: list[str] = []
+    for msg in reversed(msgs):
+        if not isinstance(msg, ToolMessage):
+            continue
+        tid = getattr(msg, "tool_call_id", None)
+        name, args = _find_tool_call(msgs, tid)
+        if not name:
+            name = getattr(msg, "name", None) or "tool"
+        arg_preview = ""
+        if isinstance(args, dict) and args:
+            keys = list(args)[:2]
+            arg_preview = str({k: args[k] for k in keys})
+            if len(arg_preview) > 120:
+                arg_preview = arg_preview[:117] + "..."
+        body = msg.content if isinstance(msg.content, str) else str(msg.content)
+        preview = body.replace("\n", " ")[:160]
+        if len(body) > 160:
+            preview += "..."
+        lines.append(f"- `{name}` {arg_preview} → {preview}")
+        if len(lines) >= MAX_TOOL_DIGEST_ITEMS:
+            break
+    return "\n".join(reversed(lines))
+
+
+def _prepare_messages_for_llm(messages: list[Any]) -> list[Any]:
+    """Truncate very long tool outputs in a copy for the LLM only (state keeps full content)."""
+    out: list[Any] = []
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            content = m.content
+            if isinstance(content, str) and len(content) > MAX_TOOL_MSG_CHARS:
+                trimmed = content[:MAX_TOOL_MSG_CHARS] + "\n... [tool output truncated for context]"
+                out.append(
+                    ToolMessage(
+                        content=trimmed,
+                        tool_call_id=m.tool_call_id,
+                        name=getattr(m, "name", None),
+                    )
+                )
+            else:
+                out.append(m)
+        else:
+            out.append(m)
+    return out
+
+
 def agent_node(state: AgentState) -> AgentState:
     """Agent node - calls LLM with tools bound."""
     # Build messages list
     messages = state["messages"].copy()
 
+    prompt_state = dict(state)
+    prompt_state["tool_digest"] = _compact_tool_digest(state["messages"])
+
     # Add system message if this is the first call
     if len(messages) == 0 or not isinstance(messages[0], SystemMessage):
-        system_msg = SystemMessage(content=f"You are a helpful assistant. Complete this task: {state['task']}")
+        system_msg = SystemMessage(content=build_system_prompt(prompt_state))
         messages.insert(0, system_msg)
+
+    messages_for_llm = _prepare_messages_for_llm(messages)
 
     # Initialize LLM with tools
     llm = _chat(state["model"])
@@ -71,12 +171,12 @@ def agent_node(state: AgentState) -> AgentState:
         "LLM request session_id=%s model=%s n_messages=%s",
         state["session_id"],
         state["model"],
-        len(messages),
+        len(messages_for_llm),
     )
-    logger.info("LLM request messages:\n%s", _format_messages_for_log(messages))
+    logger.info("LLM request messages:\n%s", _format_messages_for_log(messages_for_llm))
 
-    # Call LLM
-    response = llm_with_tools.invoke(messages)
+    # Call LLM (truncated tool bodies only in this copy)
+    response = llm_with_tools.invoke(messages_for_llm)
 
     logger.info("LLM response session_id=%s", state["session_id"])
     logger.info("LLM response:\n%s", _format_ai_response_for_log(response))
@@ -131,14 +231,14 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
     total_tokens = 0
 
     for msg in tool_messages:
-        content = msg.content if hasattr(msg, 'content') else str(msg)
+        content = msg.content if hasattr(msg, "content") else str(msg)
         tokens = count_tokens(content)
         total_tokens += tokens
 
         # Log tool result
         result_entry = {
             "content": content,
-            "tokens": tokens
+            "tokens": tokens,
         }
         new_state["tool_results"] = new_state.get("tool_results", []) + [result_entry]
 
@@ -148,6 +248,10 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
     # Check if budget exceeded
     if new_state["tokens_used"] >= state["max_tokens"]:
         new_state["status"] = "summarizing"
+
+    tm_only = [m for m in tool_messages if isinstance(m, ToolMessage)]
+    new_paths = _paths_from_tool_messages(tool_result["messages"], tm_only)
+    new_state["recent_files"] = _merge_recent_files(state.get("recent_files"), new_paths)
 
     return new_state
 
@@ -170,7 +274,7 @@ def budget_gate(state: AgentState) -> str:
 def after_tools_gate(state: AgentState) -> str:
     """Route from tools node: model must run again to consume tool results; do not use budget_gate here.
 
-    After ToolNode, the last message is a ToolMessage (no tool_calls), so reusing budget_gate would
+    After ToolNode, the last message is ToolMessage (no tool_calls), so reusing budget_gate would
     incorrectly return \"end\" and terminate before the agent reads tool output.
     """
     if state["status"] == "summarizing":
@@ -204,7 +308,7 @@ Tool calls made:
     llm = _chat(state["model"])
     response = llm.invoke([HumanMessage(content=summary_prompt)])
 
-    summary = response.content if hasattr(response, 'content') else str(response)
+    summary = response.content if hasattr(response, "content") else str(response)
 
     summary_tokens = tokens_from_llm_message(response, state["model"])
 
@@ -258,8 +362,8 @@ def build_graph(db_path: str = "~/.agent-runtime-mvp/sessions.db"):
         {
             "tools": "tools",
             "summarize": "summarize",
-            "end": END
-        }
+            "end": END,
+        },
     )
 
     # From tools: always return to agent unless budget requires summarization
@@ -294,12 +398,14 @@ def run_graph(
         "session_id": session_id,
         "task": task,
         "model": model,
+        "workspace_root": str(Path.cwd()),
         "messages": [HumanMessage(content=task)],
         "tool_results": [],
         "tokens_used": 0,
         "max_tokens": max_tokens,
         "status": "running",
-        "summary": None
+        "summary": None,
+        "recent_files": [],
     }
 
     # Run graph
