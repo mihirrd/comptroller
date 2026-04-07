@@ -9,6 +9,7 @@ dependencies = [
     "langchain-litellm>=0.2.0",
     "langgraph>=1.0.9",
     "langgraph-checkpoint-sqlite>=3.0.3",
+    "litellm>=1.82.6",
     "python-dotenv>=1.2.1",
     "rich>=14.3.3",
     "tiktoken>=0.12.0",

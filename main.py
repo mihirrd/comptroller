@@ -6,7 +6,6 @@ from pathlib import Path
 import typer
 from typing_extensions import Annotated
 from graph import summarize_node
-import logging_config
 import store
 import ui
 from dotenv import load_dotenv
@@ -192,53 +191,31 @@ def run(
             status = ui.console.status(f"[{ui.THEME['llm']}]● Working on it...[/]", spinner="dots")
             status.start()
 
-            logger.info(
-                "Graph stream start session_id=%s model=%s tokens_used=%s max_tokens=%s task=%r",
-                session_id,
-                model,
-                current_tokens,
-                max_tokens,
-                task,
-            )
-            logger.info(
-                "Initial messages for this turn (before system prompt in graph): %s",
-                _log_repr_preview(turn_state["messages"][0]),
-            )
-
             token_count = 0
             ai_message = ""
             budget_exhausted = False
             for chunk in graph.stream(turn_state, config, stream_mode=["messages", "updates"]):
                 mode, data = chunk
-                logger.debug("stream chunk mode=%s", mode)
                 if mode == "messages":
                     message_chunk, metadata = data
                     node = metadata.get("langgraph_node")
-                    logger.debug(
-                        "stream messages langgraph_node=%s chunk=%s",
-                        node,
-                        _log_repr_preview(message_chunk),
-                    )
 
                     # Stream text tokens live from agent node only
                     if node == "agent" and message_chunk.content:
                         ai_message += message_chunk.content
-                        # print(message_chunk.content, end="")
+                        print(message_chunk.content, end="")
                         token_count += 1
                     
-                    if token_count >= 5:
+                    if token_count >= max_tokens:
                         # Stop spinner after receiving some tokens
                         status.stop()
+                        budget_exhausted = True
+                        break
                 
                 elif mode == "updates":
                     if not isinstance(data, dict):
-                        logger.debug(
-                            "stream updates non-dict payload: %s",
-                            _log_repr_preview(data),
-                        )
                         continue
-                    logger.debug("stream updates node keys: %s", list(data.keys()))
-
+                    
                     for node_name, node_state in data.items():
                         final_state = node_state
 
