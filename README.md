@@ -26,7 +26,7 @@ Most “agent” demos ignore resource limits. This MVP makes the budget a first
 ```bash
 uv sync
 export OPENAI_API_KEY=sk-...
-uv run python main.py init
+uv run comptroller init
 ```
 
 If you use another provider, set the corresponding environment variable (see LiteLLM docs).
@@ -35,12 +35,12 @@ If you use another provider, set the corresponding environment variable (see Lit
 
 ### Initialize the runtime
 ```bash
-uv run python main.py init
+uv run comptroller init
 ```
 
 ### Start a new session
 ```bash
-uv run python main.py run "list all python files"
+uv run comptroller run "list all python files"
 ```
 
 The session stays open for follow-up tasks until you quit or the budget is exhausted:
@@ -50,22 +50,22 @@ Task (or 'quit' to exit): count the total lines in all python files
 
 ### Resume a session
 ```bash
-uv run python main.py run --session abc12345
+uv run comptroller run --session abc12345
 ```
 
 ### List sessions
 ```bash
-uv run python main.py sessions
+uv run comptroller sessions
 ```
 
 ### Inspect a session
 ```bash
-uv run python main.py inspect --session abc12345
+uv run comptroller inspect --session abc12345
 ```
 
 ### Clear all sessions
 ```bash
-uv run python main.py clear-sessions
+uv run comptroller clear-sessions
 ```
 
 ### Key options
@@ -91,15 +91,18 @@ uv run python main.py clear-sessions
 
 ```
 .
-├── main.py              # Typer CLI entry point
-├── graph.py             # LangGraph orchestration and nodes
-├── state.py             # AgentState TypedDict
-├── budget.py            # TokenBudget and token counting
-├── tools.py             # Built-in tools
-├── store.py             # SQLite persistence
-├── ui.py                # Rich terminal UI
-├── logging_config.py    # File-only logging setup
-├── tests/               # Budget + graph tests
+├── src/
+│   └── comptroller/
+│       ├── __init__.py
+│       ├── main.py              # Typer CLI entry point
+│       ├── graph.py             # LangGraph orchestration and nodes
+│       ├── state.py             # AgentState TypedDict
+│       ├── budget.py            # TokenBudget and token counting
+│       ├── tools.py             # Built-in tools
+│       ├── store.py             # SQLite persistence
+│       ├── ui.py                # Rich terminal UI
+│       └── logging_config.py    # File-only logging setup
+├── tests/                       # Budget + graph tests
 ```
 
 ## Tests
