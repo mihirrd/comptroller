@@ -5,9 +5,10 @@ import uuid
 from pathlib import Path
 import typer
 from typing_extensions import Annotated
-from graph import summarize_node
-import store
-import ui
+from .graph import summarize_node
+from . import logging_config
+from . import store
+from . import ui
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -95,8 +96,8 @@ def run(
 ):
     """Run an agent task with token budget tracking. Supports continuous conversation mode."""
     from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
-    from budget import tokens_from_llm_message
-    from graph import build_graph
+    from .budget import tokens_from_llm_message
+    from .graph import build_graph
     ui.print_banner()
 
     if not _available_llm_models():
@@ -263,7 +264,7 @@ def run(
                                                 break
 
                                         # Estimate tokens
-                                        from budget import count_tokens
+                                        from .budget import count_tokens
                                         tokens_this_step = count_tokens(content)
 
                                         ui.print_step_tool(step_counter, tool_name, tool_input, content, tokens_this_step)

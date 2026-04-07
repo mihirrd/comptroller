@@ -2,8 +2,8 @@ import pytest
 from unittest.mock import patch, MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from graph import after_tools_gate, agent_node, budget_gate, summarize_node
-from state import AgentState
+from comptroller.graph import after_tools_gate, agent_node, budget_gate, summarize_node
+from comptroller.state import AgentState
 
 
 def test_agent_node_no_tool_calls():

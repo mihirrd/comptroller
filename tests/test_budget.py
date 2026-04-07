@@ -1,5 +1,5 @@
 import pytest
-from budget import TokenBudget, count_tokens
+from comptroller.budget import TokenBudget, count_tokens
 
 
 def test_token_budget_starts_at_zero():
