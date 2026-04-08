@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-import tools as tools_mod
-from tools import (
+import comptroller.tools as tools_mod
+from comptroller.tools import (
     WORKSPACE_ROOT_ENV,
     apply_patch,
     glob_files,

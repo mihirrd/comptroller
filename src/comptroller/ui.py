@@ -17,6 +17,19 @@ THEME = {
 }
 
 
+def format_wall_seconds(seconds: float) -> str:
+    """Human-friendly duration for agent wall-time totals."""
+    s = max(0.0, float(seconds))
+    if s < 60:
+        return f"{s:.1f}s"
+    total = int(round(s))
+    m, sec = divmod(total, 60)
+    if m < 60:
+        return f"{m}m {sec}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {sec}s"
+
+
 def print_banner():
     """Print product banner."""
     console.print()
@@ -28,13 +41,31 @@ def print_banner():
     console.print()
 
 
-def print_session_header(session_id: str, task: str, model: str, max_tokens: int):
+def print_session_header(
+    session_id: str,
+    task: str,
+    model: str,
+    max_tokens: int,
+    *,
+    max_api_dollars: float | None = None,
+    max_wall_seconds: float | None = None,
+):
     """Print session header before execution."""
-    console.print(Panel(
-        f"[bold]Session:[/bold] {session_id}\n"
-        f"[bold]Task:[/bold] {task}\n"
-        f"[bold]Model:[/bold] {model}\n"
+    lines = [
+        f"[bold]Session:[/bold] {session_id}",
+        f"[bold]Task:[/bold] {task}",
+        f"[bold]Model:[/bold] {model}",
         f"[bold]Max Tokens:[/bold] {max_tokens:,}",
+    ]
+    if max_api_dollars is not None:
+        lines.append(f"[bold]Max API spend (est.):[/bold] ${max_api_dollars:.4f} USD (LiteLLM pricing)")
+    if max_wall_seconds is not None:
+        lines.append(
+            f"[bold]Max agent wall time:[/bold] {format_wall_seconds(max_wall_seconds)} "
+            f"({max_wall_seconds:.0f}s)"
+        )
+    console.print(Panel(
+        "\n".join(lines),
         title="[bold]Starting Session[/bold]",
         border_style=THEME["accent"]
     ))
@@ -80,11 +111,19 @@ def print_step_llm(step: int, content: str, tokens: int):
     console.print()
 
 
-def print_token_bar(used: int, max_tokens: int):
-    """Print inline token usage bar."""
-    pct = (used / max_tokens) * 100
+def print_token_bar(
+    used: int,
+    max_tokens: int,
+    *,
+    dollars_used: float | None = None,
+    max_dollars: float | None = None,
+    wall_seconds_used: float | None = None,
+    max_wall_seconds: float | None = None,
+):
+    """Print inline token usage bar; optional lines for API dollar and wall-time budgets."""
+    pct = (used / max_tokens) * 100 if max_tokens else 0.0
     bar_width = 20
-    filled = int((used / max_tokens) * bar_width)
+    filled = int((used / max_tokens) * bar_width) if max_tokens else 0
     bar = "█" * filled + "░" * (bar_width - filled)
 
     # Color based on percentage
@@ -100,13 +139,45 @@ def print_token_bar(used: int, max_tokens: int):
         f"[{color}]{bar}[/{color}]  "
         f"[{color}]{pct:.0f}%[/{color}]"
     )
+    if max_dollars is not None and dollars_used is not None and max_dollars > 0:
+        dpct = min(100.0, (dollars_used / max_dollars) * 100)
+        dfilled = int((dollars_used / max_dollars) * bar_width)
+        dbar = "█" * min(bar_width, dfilled) + "░" * max(0, bar_width - min(bar_width, dfilled))
+        if dpct < 70:
+            dcolor = "green"
+        elif dpct < 90:
+            dcolor = "yellow"
+        else:
+            dcolor = "red"
+        console.print(
+            f"[bold]API $ (est.):[/bold] [{dcolor}]${dollars_used:.4f} / ${max_dollars:.4f}[/{dcolor}]  "
+            f"[{dcolor}]{dbar}[/{dcolor}]  "
+            f"[{dcolor}]{dpct:.0f}%[/{dcolor}]"
+        )
+    if max_wall_seconds is not None and wall_seconds_used is not None and max_wall_seconds > 0:
+        wpct = min(100.0, (wall_seconds_used / max_wall_seconds) * 100)
+        wfilled = int((wall_seconds_used / max_wall_seconds) * bar_width)
+        wbar = "█" * min(bar_width, wfilled) + "░" * max(0, bar_width - min(bar_width, wfilled))
+        if wpct < 70:
+            wcolor = "green"
+        elif wpct < 90:
+            wcolor = "yellow"
+        else:
+            wcolor = "red"
+        wu = format_wall_seconds(wall_seconds_used)
+        wm = format_wall_seconds(max_wall_seconds)
+        console.print(
+            f"[bold]agent wall:[/bold] [{wcolor}]{wu} / {wm}[/{wcolor}]  "
+            f"[{wcolor}]{wbar}[/{wcolor}]  "
+            f"[{wcolor}]{wpct:.0f}%[/{wcolor}]"
+        )
     console.print()
 
 
-def print_summarizing():
+def print_summarizing(reason: str = "Token budget exceeded"):
     """Print notice that summarization is starting."""
     console.print(Panel(
-        "[bold]Token budget exceeded - generating summary...[/bold]",
+        f"[bold]{reason} — generating summary...[/bold]",
         border_style=THEME["warning"]
     ))
     console.print()
@@ -149,6 +220,18 @@ def print_sessions_table(sessions: list[dict]):
     for session in sessions:
         task_preview = session["task"][:50] + "..." if len(session["task"]) > 50 else session["task"]
         tokens = f"{session['tokens_used']:,} / {session['max_tokens']:,}"
+        cap = session.get("max_api_dollars")
+        spent = float(session.get("api_dollars_used") or 0)
+        if cap is not None:
+            tokens += f"\n${spent:.3f}/${float(cap):.2f}"
+        wcap = session.get("max_wall_seconds")
+        wspent = float(session.get("wall_seconds_used") or 0)
+        if wcap is not None:
+            tokens += f"\n{format_wall_seconds(wspent)}/{format_wall_seconds(float(wcap))}"
+        rcap = session.get("max_session_retries")
+        rused = int(session.get("session_retries_used") or 0)
+        if rcap is not None:
+            tokens += f"\nretries {rused}/{int(rcap)}"
         created = datetime.fromtimestamp(session["created_at"]).strftime("%Y-%m-%d %H:%M")
 
         table.add_row(
@@ -170,11 +253,34 @@ def print_inspect(session: dict, steps: list[dict]):
         return
 
     # Session header
+    cap = session.get("max_api_dollars")
+    spent = float(session.get("api_dollars_used") or 0)
+    dollar_line = ""
+    if cap is not None:
+        dollar_line = f"\n[bold]Est. API spend:[/bold] ${spent:.4f} / ${float(cap):.4f} (LiteLLM)"
+    wcap = session.get("max_wall_seconds")
+    wspent = float(session.get("wall_seconds_used") or 0)
+    wall_line = ""
+    if wcap is not None:
+        wall_line = (
+            f"\n[bold]Agent wall time:[/bold] {format_wall_seconds(wspent)} / "
+            f"{format_wall_seconds(float(wcap))} ({wspent:.1f}s / {float(wcap):.0f}s)"
+        )
+    elif wspent > 0:
+        wall_line = f"\n[bold]Agent wall time:[/bold] {format_wall_seconds(wspent)} ({wspent:.1f}s)"
+    rcap = session.get("max_session_retries")
+    rused = int(session.get("session_retries_used") or 0)
+    retry_line = ""
+    if rcap is not None:
+        retry_line = f"\n[bold]LLM backoff retries:[/bold] {rused} / {int(rcap)}"
+    elif rused > 0:
+        retry_line = f"\n[bold]LLM backoff retries used:[/bold] {rused}"
     console.print(Panel(
         f"[bold]Session ID:[/bold] {session['session_id']}\n"
         f"[bold]Task:[/bold] {session['task']}\n"
         f"[bold]Status:[/bold] {session['status']}\n"
-        f"[bold]Tokens:[/bold] {session['tokens_used']:,} / {session['max_tokens']:,}\n"
+        f"[bold]Tokens:[/bold] {session['tokens_used']:,} / {session['max_tokens']:,}"
+        f"{dollar_line}{wall_line}{retry_line}\n"
         f"[bold]Created:[/bold] {datetime.fromtimestamp(session['created_at']).strftime('%Y-%m-%d %H:%M:%S')}",
         title="[bold]Session Details[/bold]",
         border_style=THEME["accent"]

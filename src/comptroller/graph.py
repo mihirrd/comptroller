@@ -13,10 +13,10 @@ from langgraph.prebuilt import ToolNode
 from langchain_litellm import ChatLiteLLM
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from state import AgentState
-from tools import TOOLS, set_workspace_root_for_tools
-from budget import count_tokens, tokens_from_llm_message
-from prompt_builder import build_system_prompt
+from .state import AgentState
+from .tools import TOOLS, set_workspace_root_for_tools
+from .budget import count_tokens, dollars_from_llm_message, tokens_from_llm_message
+from .prompt_builder import build_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,18 @@ _LLM_TRANSIENT_EXCEPTIONS = (
 )
 
 
+class SessionTransientRetryBudgetExhausted(Exception):
+    """Raised when ``max_session_retries`` is set and another backoff retry would exceed it."""
+
+    def __init__(self, used: int, max_retries: int, cause: BaseException):
+        self.used = used
+        self.max_retries = max_retries
+        self.cause = cause
+        super().__init__(
+            f"Session transient retry budget exhausted ({used}/{max_retries} backoff retries used): {cause}"
+        )
+
+
 def _llm_retry_attempts() -> int:
     raw = os.environ.get("COMPTROLLER_LLM_RETRY_ATTEMPTS", "8")
     try:
@@ -92,8 +104,18 @@ def _llm_backoff_seconds(attempt_index: int) -> float:
     return min(cap, delay)
 
 
-def _invoke_with_transient_retries(fn: Callable[[], T], *, context: str) -> T:
-    """Run ``fn``; on rate limits and common transient API errors, sleep with exponential backoff and retry."""
+def _invoke_with_transient_retries(
+    fn: Callable[[], T],
+    *,
+    context: str,
+    retry_budget_state: AgentState | None = None,
+) -> T:
+    """Run ``fn``; on rate limits and common transient API errors, sleep with exponential backoff and retry.
+
+    If ``retry_budget_state`` is set and ``max_session_retries`` is not None, each backoff retry
+    (after a transient error, before ``sleep``) increments ``session_retries_used``. When the cap
+    would be exceeded, raises :class:`SessionTransientRetryBudgetExhausted` instead of retrying.
+    """
     attempts = _llm_retry_attempts()
     for attempt in range(attempts):
         try:
@@ -102,6 +124,28 @@ def _invoke_with_transient_retries(fn: Callable[[], T], *, context: str) -> T:
             if attempt >= attempts - 1:
                 logger.error("%s: failed after %s attempts: %s", context, attempts, e)
                 raise
+            if retry_budget_state is not None:
+                cap = retry_budget_state.get("max_session_retries")
+                if cap is not None:
+                    used = int(retry_budget_state.get("session_retries_used", 0))
+                    if used >= cap:
+                        logger.error(
+                            "%s: session transient retry budget exhausted (%s/%s) after %s: %s",
+                            context,
+                            used,
+                            cap,
+                            type(e).__name__,
+                            e,
+                        )
+                        raise SessionTransientRetryBudgetExhausted(used, cap, e) from e
+                    retry_budget_state["session_retries_used"] = used + 1
+                    logger.info(
+                        "%s: session transient backoff retry %s/%s after %s",
+                        context,
+                        retry_budget_state["session_retries_used"],
+                        cap,
+                        type(e).__name__,
+                    )
             delay = _llm_backoff_seconds(attempt)
             logger.warning(
                 "%s: %s (attempt %s/%s); sleeping %.1fs then retrying",
@@ -277,32 +321,51 @@ def agent_node(state: AgentState) -> AgentState:
     logger.info("LLM request messages:\n%s", _format_messages_for_log(messages_for_llm))
 
     # Call LLM (truncated tool bodies only in this copy)
+    _t_wall = time.monotonic()
     response = _invoke_with_transient_retries(
         lambda: llm_with_tools.invoke(messages_for_llm),
         context=f"LLM agent session_id={state['session_id']}",
+        retry_budget_state=state,
     )
+    _wall_dt = time.monotonic() - _t_wall
 
     logger.info("LLM response session_id=%s", state["session_id"])
     logger.info("LLM response:\n%s", _format_ai_response_for_log(response))
 
     tokens = tokens_from_llm_message(response, state["model"])
+    call_dollars = dollars_from_llm_message(response, state["model"])
 
     # Update state
     new_state = state.copy()
     new_state["tokens_used"] = state["tokens_used"] + tokens
+    new_state["api_dollars_used"] = state["api_dollars_used"] + call_dollars
+    new_state["wall_seconds_used"] = state["wall_seconds_used"] + _wall_dt
     new_state["messages"] = state["messages"] + [response]
 
+    cap = state.get("max_api_dollars")
+    wcap = state.get("max_wall_seconds")
     logger.info(
-        "LLM exchange session_id=%s model=%s tokens_this_call=%s tokens_used_total=%s max_tokens=%s",
+        "LLM exchange session_id=%s model=%s tokens_this_call=%s tokens_used_total=%s max_tokens=%s "
+        "dollars_this_call=%.6f api_dollars_total=%.6f max_api_dollars=%s wall_step=%.3fs wall_total=%.3fs max_wall=%s",
         state["session_id"],
         state["model"],
         tokens,
         new_state["tokens_used"],
         state["max_tokens"],
+        call_dollars,
+        new_state["api_dollars_used"],
+        cap,
+        _wall_dt,
+        new_state["wall_seconds_used"],
+        wcap,
     )
 
     # Check if budget exceeded
     if new_state["tokens_used"] >= state["max_tokens"]:
+        new_state["status"] = "summarizing"
+    if cap is not None and new_state["api_dollars_used"] >= cap:
+        new_state["status"] = "summarizing"
+    if wcap is not None and new_state["wall_seconds_used"] >= wcap:
         new_state["status"] = "summarizing"
 
     return new_state
@@ -314,7 +377,9 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
     tool_executor = ToolNode(TOOLS)
 
     # Execute tools (this only returns updated messages)
+    _t_wall = time.monotonic()
     tool_result = tool_executor.invoke(state)
+    _wall_dt = time.monotonic() - _t_wall
 
     logger.info(
         "Tool execution session_id=%s new_messages appended:\n%s",
@@ -348,9 +413,13 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
 
     # Update token count
     new_state["tokens_used"] = state["tokens_used"] + total_tokens
+    new_state["wall_seconds_used"] = state["wall_seconds_used"] + _wall_dt
 
     # Check if budget exceeded
     if new_state["tokens_used"] >= state["max_tokens"]:
+        new_state["status"] = "summarizing"
+    wcap = state.get("max_wall_seconds")
+    if wcap is not None and new_state["wall_seconds_used"] >= wcap:
         new_state["status"] = "summarizing"
 
     tm_only = [m for m in tool_messages if isinstance(m, ToolMessage)]
@@ -408,16 +477,20 @@ Tool calls made:
     )
     logger.info("Summarize prompt:\n%s", _truncate(summary_prompt, 8000))
 
-    # Call LLM for summary (does not check budget)
+    # Call LLM for summary (does not check token/dollar budget; wall time still accumulates)
     llm = _chat(state["model"])
+    _t_wall = time.monotonic()
     response = _invoke_with_transient_retries(
         lambda: llm.invoke([HumanMessage(content=summary_prompt)]),
         context=f"LLM summarize session_id={state['session_id']}",
+        retry_budget_state=state,
     )
+    _wall_dt = time.monotonic() - _t_wall
 
     summary = response.content if hasattr(response, "content") else str(response)
 
     summary_tokens = tokens_from_llm_message(response, state["model"])
+    summary_dollars = dollars_from_llm_message(response, state["model"])
 
     logger.info(
         "Summarize response session_id=%s summary=%s",
@@ -430,13 +503,20 @@ Tool calls made:
     new_state["status"] = "complete"
     new_state["summary"] = summary
     new_state["tokens_used"] = state["tokens_used"] + summary_tokens
+    new_state["api_dollars_used"] = state["api_dollars_used"] + summary_dollars
+    new_state["wall_seconds_used"] = state["wall_seconds_used"] + _wall_dt
 
     logger.info(
-        "Summarize LLM exchange session_id=%s model=%s tokens_this_call=%s tokens_used_total=%s",
+        "Summarize LLM exchange session_id=%s model=%s tokens_this_call=%s tokens_used_total=%s "
+        "dollars_this_call=%.6f api_dollars_total=%.6f wall_step=%.3fs wall_total=%.3fs",
         state["session_id"],
         state["model"],
         summary_tokens,
         new_state["tokens_used"],
+        summary_dollars,
+        new_state["api_dollars_used"],
+        _wall_dt,
+        new_state["wall_seconds_used"],
     )
 
     return new_state
@@ -496,6 +576,9 @@ def run_graph(
     session_id: str,
     model: str = "gpt-4o",
     db_path: str = "~/.agent-runtime-mvp/sessions.db",
+    max_api_dollars: float | None = None,
+    max_wall_seconds: float | None = None,
+    max_session_retries: int | None = None,
 ):
     """Run the graph and return final state."""
     graph = build_graph(db_path)
@@ -510,6 +593,12 @@ def run_graph(
         "tool_results": [],
         "tokens_used": 0,
         "max_tokens": max_tokens,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": max_api_dollars,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": max_wall_seconds,
+        "session_retries_used": 0,
+        "max_session_retries": max_session_retries,
         "status": "running",
         "summary": None,
         "recent_files": [],

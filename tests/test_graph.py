@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from graph import (
+from comptroller.graph import (
     MAX_TOOL_MSG_CHARS,
     _prepare_messages_for_llm,
     after_tools_gate,
@@ -14,7 +14,8 @@ from graph import (
     summarize_node,
     tool_node_wrapper,
 )
-from state import AgentState
+from comptroller.budget import dollars_from_llm_message
+from comptroller.state import AgentState
 
 
 def test_agent_node_no_tool_calls():
@@ -29,6 +30,12 @@ def test_agent_node_no_tool_calls():
         "tool_results": [],
         "tokens_used": 0,
         "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
         "status": "running",
         "summary": None
     }
@@ -36,7 +43,7 @@ def test_agent_node_no_tool_calls():
     # Mock LLM response with no tool calls
     mock_response = AIMessage(content="Task completed successfully")
 
-    with patch('graph.ChatLiteLLM') as mock_llm_class:
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
         mock_llm = MagicMock()
         mock_llm.bind_tools.return_value.invoke.return_value = mock_response
         mock_llm_class.return_value = mock_llm
@@ -64,6 +71,12 @@ def test_agent_node_with_tool_calls():
         "tool_results": [],
         "tokens_used": 0,
         "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
         "status": "running",
         "summary": None
     }
@@ -78,7 +91,7 @@ def test_agent_node_with_tool_calls():
         }]
     )
 
-    with patch('graph.ChatLiteLLM') as mock_llm_class:
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
         mock_llm = MagicMock()
         mock_llm.bind_tools.return_value.invoke.return_value = mock_response
         mock_llm_class.return_value = mock_llm
@@ -109,6 +122,12 @@ def test_after_tools_gate_routes_to_continue_not_end():
         "tool_results": [],
         "tokens_used": 0,
         "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
         "status": "running",
         "summary": None,
     }
@@ -128,10 +147,102 @@ def test_after_tools_gate_respects_summarizing():
         "tool_results": [],
         "tokens_used": 100,
         "max_tokens": 50,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
         "status": "summarizing",
         "summary": None,
     }
     assert after_tools_gate(state) == "summarize"
+
+
+def test_wall_budget_exceeded_triggers_summarize():
+    """When max_wall_seconds is exceeded after the agent step, route to summarizing."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "test task",
+        "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": 1.0,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "running",
+        "summary": None,
+    }
+    mock_response = AIMessage(
+        content="Short",
+        usage_metadata={
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+        },
+        response_metadata={"model_name": "gpt-4o"},
+    )
+    with (
+        patch("comptroller.graph.ChatLiteLLM") as mock_llm_class,
+        patch("comptroller.graph.time.monotonic", side_effect=[0.0, 5.0]),
+    ):
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        result = agent_node(state)
+
+    assert result["status"] == "summarizing"
+    assert result["wall_seconds_used"] >= state["max_wall_seconds"]
+    assert budget_gate(result) == "summarize"
+
+
+def test_dollar_budget_exceeded_triggers_summarize():
+    """When max_api_dollars is already reached after this call, route to summarizing."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "test task",
+        "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": 0.0001,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "running",
+        "summary": None,
+    }
+    mock_response = AIMessage(
+        content="Short",
+        usage_metadata={
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "total_tokens": 1500,
+        },
+        response_metadata={"model_name": "gpt-4o"},
+    )
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        result = agent_node(state)
+
+    assert result["status"] == "summarizing"
+    assert result["api_dollars_used"] >= state["max_api_dollars"]
+    assert budget_gate(result) == "summarize"
+    assert dollars_from_llm_message(mock_response, "gpt-4o") > 0
 
 
 def test_budget_exceeded_triggers_summarize():
@@ -145,6 +256,12 @@ def test_budget_exceeded_triggers_summarize():
         "tool_results": [],
         "tokens_used": 0,
         "max_tokens": 1,  # Very low budget
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
         "status": "running",
         "summary": None
     }
@@ -152,7 +269,7 @@ def test_budget_exceeded_triggers_summarize():
     # Mock LLM response
     mock_response = AIMessage(content="This response will exceed the budget")
 
-    with patch('graph.ChatLiteLLM') as mock_llm_class:
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
         mock_llm = MagicMock()
         mock_llm.bind_tools.return_value.invoke.return_value = mock_response
         mock_llm_class.return_value = mock_llm
@@ -183,6 +300,12 @@ def test_summarize_node_completes():
         ],
         "tokens_used": 100,
         "max_tokens": 50,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
         "status": "summarizing",
         "summary": None
     }
@@ -190,7 +313,7 @@ def test_summarize_node_completes():
     # Mock LLM response for summary
     mock_summary = AIMessage(content="Task summary: completed some work")
 
-    with patch('graph.ChatLiteLLM') as mock_llm_class:
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
         mock_llm = MagicMock()
         mock_llm.invoke.return_value = mock_summary
         mock_llm_class.return_value = mock_llm
@@ -228,6 +351,12 @@ def test_tool_node_tracks_recent_files():
             "tool_results": [],
             "tokens_used": 0,
             "max_tokens": 5000,
+            "api_dollars_used": 0.0,
+            "max_api_dollars": None,
+            "wall_seconds_used": 0.0,
+            "max_wall_seconds": None,
+            "session_retries_used": 0,
+            "max_session_retries": None,
             "status": "running",
             "summary": None,
         }
@@ -240,7 +369,7 @@ def test_tool_node_tracks_recent_files():
         mock_exec = MagicMock()
         mock_exec.invoke.return_value = {"messages": merged}
 
-        with patch("graph.ToolNode", return_value=mock_exec):
+        with patch("comptroller.graph.ToolNode", return_value=mock_exec):
             out = tool_node_wrapper(state)
 
         assert resolved in out["recent_files"]

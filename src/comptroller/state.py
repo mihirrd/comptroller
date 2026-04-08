@@ -12,6 +12,12 @@ class AgentState(TypedDict):
     tool_results: list[dict]
     tokens_used: int
     max_tokens: int
+    api_dollars_used: float  # cumulative estimated API spend (USD) from LiteLLM pricing
+    max_api_dollars: float | None  # None = no dollar cap (token budget may still apply)
+    wall_seconds_used: float  # cumulative wall time (monotonic) while agent/tools/summarize run
+    max_wall_seconds: float | None  # None = no wall-time cap
+    session_retries_used: int  # LLM transient-error backoff retries consumed this session
+    max_session_retries: int | None  # None = unlimited (per-call COMPTROLLER_LLM_RETRY_ATTEMPTS still applies)
     status: str  # "running" | "summarizing" | "complete"
     summary: str | None
     recent_files: NotRequired[list[str]]  # optional; filled when tool tracking is wired
