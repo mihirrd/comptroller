@@ -25,9 +25,13 @@ comptroller = "comptroller.main:app"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+comptroller = ["prompts/*.md"]
 
 [dependency-groups]
 dev = [
