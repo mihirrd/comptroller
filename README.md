@@ -1,25 +1,124 @@
-# Title
-A Budget-Aware Runtime for Deterministic and Cost-Constrained Agentic Systems
+# Comptroller - A Budget-aware Agentic Runtime
 
-## Motivation:
-Agentic systems that use large language models are increasingly capable of performing
-complex software engineering tasks such as debugging, code reviews, and dependency
-updates. However, most existing frameworks treat cost, latency, and failure as secondary
-concerns and rely on best-effort execution. This limits their applicability in real-world
-engineering environments where budgets, reliability, and reproducibility are critical. This
-project addresses the need for a general-purpose agent execution runtime that treats
-budgets and termination policies as first-class concerns.
+A minimal, budget-aware agent runtime that tracks token usage across a continuous conversation loop, with SQLite persistence and a rich terminal UI.
 
-## Problem statement:
-Current agentic systems lack a standardized runtime that can reliably execute complex,
-tool-using workflows over code repositories, APIs, and documents while enforcing strict
-operational budgets. Existing frameworks do not provide mechanisms for continuous
-tracking of resource constraints such as token usage, API costs, tool calls, retries, or wall-
-clock time, nor do they handle graceful degradation when budgets are exceeded.
-Additionally, they rarely support explicit termination policies such as stopping and
-summarizing work, requesting human intervention, or returning best-effort outputs, and
-often lack stable integration interfaces for other projects. This project addresses these
-gaps by designing a general-purpose agent execution runtime that enforces budget and
-termination policies, supports planning/execution loops with partial results, allows fallback
-to smaller or local models, and exposes a stable API with a minimal user interface for
-integration as an “agent execution substrate.”
+## Why this exists
+
+Most “agent” demos ignore resource limits. This MVP makes the budget a first-class constraint: each tool call and LLM response is counted, and the run ends with a summary when the limit is hit.
+
+## Features
+
+- Token budget tracking across LLM calls and tool outputs.
+- LangGraph orchestration with a budget gate and summarization fallback.
+- SQLite persistence for sessions and step-by-step execution history.
+- Rich terminal UI with a live token bar and formatted outputs.
+- Built-in tools: read_file, write_file, list_directory, run_shell.
+- LiteLLM model support (OpenAI, Anthropic, Gemini, Groq, etc.).
+
+## Requirements
+
+- Python >= 3.13
+- `uv` (recommended) or any Python environment manager
+- One or more provider API keys supported by LiteLLM
+
+## Installation
+
+```bash
+uv sync
+export OPENAI_API_KEY=sk-...
+uv run comptroller init
+```
+
+If you use another provider, set the corresponding environment variable (see LiteLLM docs).
+
+## Usage
+
+### Initialize the runtime
+```bash
+uv run comptroller init
+```
+
+### Start a new session
+```bash
+uv run comptroller run "list all python files"
+```
+
+The session stays open for follow-up tasks until you quit or the budget is exhausted:
+```
+Task (or 'quit' to exit): count the total lines in all python files
+```
+
+### Resume a session
+```bash
+uv run comptroller run --session abc12345
+```
+
+### List sessions
+```bash
+uv run comptroller sessions
+```
+
+### Inspect a session
+```bash
+uv run comptroller inspect --session abc12345
+```
+
+### Clear all sessions
+```bash
+uv run comptroller clear-sessions
+```
+
+### Key options
+
+- `--max-tokens`: Token budget limit (default: 1000 or value from `max_tokens` env var)
+- `--model`: LiteLLM model id (default: `gpt-4o` or value from `model` env var)
+- `--session`: Resume an existing session
+
+## How it works
+
+1. A task starts a session with a token budget.
+2. The agent node calls the LLM with tool bindings.
+3. If tool calls are requested, the tool node executes them and counts tokens from outputs.
+4. The budget gate routes back to the agent or into summarization when the budget is hit.
+5. Steps and session metadata are stored in SQLite throughout the run.
+
+## Data and logs
+
+- Session database: `~/.agent-runtime-mvp/sessions.db`
+- Execution log file: `logs.txt` (repo root)
+
+## Project structure
+
+```
+.
+├── src/
+│   └── comptroller/
+│       ├── __init__.py
+│       ├── main.py              # Typer CLI entry point
+│       ├── graph.py             # LangGraph orchestration and nodes
+│       ├── state.py             # AgentState TypedDict
+│       ├── budget.py            # TokenBudget and token counting
+│       ├── tools.py             # Built-in tools
+│       ├── store.py             # SQLite persistence
+│       ├── ui.py                # Rich terminal UI
+│       └── logging_config.py    # File-only logging setup
+├── tests/                       # Budget + graph tests
+```
+
+## Tests
+
+```bash
+uv run pytest -v
+```
+
+All tests use mocked LLM calls (no real API requests).
+
+## Notes and limitations
+
+- This MVP focuses on token budget enforcement; it does not track cost or time.
+- Tools are intentionally minimal and run in-process.
+- SQLite checkpointer is used for LangGraph state persistence.
+
+## License
+
+MIT
