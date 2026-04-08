@@ -1,114 +1,123 @@
-# agent-runtime-mvp
+# Comptroller - A Budget-aware Agentic Runtime
 
-A minimal, working budget-aware agent runtime MVP in Python.
+A minimal, budget-aware agent runtime that tracks token usage across a continuous conversation loop, with SQLite persistence and a rich terminal UI.
+
+## Why this exists
+
+Most “agent” demos ignore resource limits. This MVP makes the budget a first-class constraint: each tool call and LLM response is counted, and the run ends with a summary when the limit is hit.
 
 ## Features
 
-- **Token Budget Tracking**: Track and enforce token usage limits across agent execution
-- **LangGraph Orchestration**: Agent → Tools → Budget Gate → Loop/Summarize
-- **SQLite Persistence**: All sessions and steps saved to database
-- **Rich Terminal UI**: Clean, colorful terminal output with live token usage bar
-- **Four Built-in Tools**: read_file, write_file, list_directory, run_shell
+- Token budget tracking across LLM calls and tool outputs.
+- LangGraph orchestration with a budget gate and summarization fallback.
+- SQLite persistence for sessions and step-by-step execution history.
+- Rich terminal UI with a live token bar and formatted outputs.
+- Built-in tools: read_file, write_file, list_directory, run_shell.
+- LiteLLM model support (OpenAI, Anthropic, Gemini, Groq, etc.).
+
+## Requirements
+
+- Python >= 3.13
+- `uv` (recommended) or any Python environment manager
+- One or more provider API keys supported by LiteLLM
 
 ## Installation
 
 ```bash
-cd agent-runtime-mvp
 uv sync
 export OPENAI_API_KEY=sk-...
-uv run python main.py init
+uv run comptroller init
 ```
+
+If you use another provider, set the corresponding environment variable (see LiteLLM docs).
 
 ## Usage
 
-### Initialize
+### Initialize the runtime
 ```bash
-uv run python main.py init
+uv run comptroller init
 ```
 
-### Run a Task (Continuous Conversation Mode)
-
-**Start a new session:**
+### Start a new session
 ```bash
-uv run python main.py run "list all python files"
+uv run comptroller run "list all python files"
 ```
 
-The agent will execute the task, then **prompt you for more tasks** in the same session:
+The session stays open for follow-up tasks until you quit or the budget is exhausted:
 ```
-Task (or 'quit' to exit): now count the total lines in all python files
+Task (or 'quit' to exit): count the total lines in all python files
 ```
 
-Budget is tracked continuously across all tasks in the conversation!
-
-**Resume an existing session:**
+### Resume a session
 ```bash
-uv run python main.py run --session abc12345
+uv run comptroller run --session abc12345
 ```
 
-Options:
-- `--session`: Resume existing session with preserved budget
-- `--max-tokens`: Token budget limit (default: 5000)
-- `--model`: OpenAI model to use (default: gpt-4o)
-
-### List Sessions
+### List sessions
 ```bash
-uv run python main.py sessions
+uv run comptroller sessions
 ```
 
-### Inspect Session
+### Inspect a session
 ```bash
-uv run python main.py inspect --session abc12345
+uv run comptroller inspect --session abc12345
 ```
 
-## Project Structure
-
-```
-agent-runtime-mvp/
-├── pyproject.toml       # Dependencies
-├── main.py              # Typer CLI entry point
-├── state.py             # AgentState TypedDict
-├── budget.py            # TokenBudget class + count_tokens()
-├── graph.py             # LangGraph orchestration
-├── tools.py             # Built-in tools
-├── store.py             # SQLite persistence
-├── ui.py                # Rich terminal output
-└── tests/
-    ├── test_budget.py
-    └── test_graph.py
+### Clear all sessions
+```bash
+uv run comptroller clear-sessions
 ```
 
-## How It Works
+### Key options
 
-1. User runs a task with a token budget
-2. LangGraph agent calls LLM with tools
-3. LLM returns tool calls → tools execute → results counted against budget
-4. Loop continues until:
-   - Task completes (LLM returns no tool calls) → Exit 0
-   - Budget exceeded → Summarize → Exit 1
-5. All steps persisted to SQLite throughout
+- `--max-tokens`: Token budget limit (default: 1000 or value from `max_tokens` env var)
+- `--model`: LiteLLM model id (default: `gpt-4o` or value from `model` env var)
+- `--session`: Resume an existing session
+
+## How it works
+
+1. A task starts a session with a token budget.
+2. The agent node calls the LLM with tool bindings.
+3. If tool calls are requested, the tool node executes them and counts tokens from outputs.
+4. The budget gate routes back to the agent or into summarization when the budget is hit.
+5. Steps and session metadata are stored in SQLite throughout the run.
+
+## Data and logs
+
+- Session database: `~/.agent-runtime-mvp/sessions.db`
+- Execution log file: `logs.txt` (repo root)
+
+## Project structure
+
+```
+.
+├── src/
+│   └── comptroller/
+│       ├── __init__.py
+│       ├── main.py              # Typer CLI entry point
+│       ├── graph.py             # LangGraph orchestration and nodes
+│       ├── state.py             # AgentState TypedDict
+│       ├── budget.py            # TokenBudget and token counting
+│       ├── tools.py             # Built-in tools
+│       ├── store.py             # SQLite persistence
+│       ├── ui.py                # Rich terminal UI
+│       └── logging_config.py    # File-only logging setup
+├── tests/                       # Budget + graph tests
+```
 
 ## Tests
 
 ```bash
-uv run pytest tests/ -v
+uv run pytest -v
 ```
 
-All tests use mocked LLM calls - no real API requests.
+All tests use mocked LLM calls (no real API requests).
 
-## What's NOT Included
+## Notes and limitations
 
-This is an MVP focused on one budget dimension (tokens) and one termination policy (summarize). Explicitly excluded:
-
-- Cost tracking
-- Time tracking
-- Tool call limits
-- Retry limits
-- Ask-human policy
-- Config files
-- Async/threading
-- FastAPI server
-
-These are Week 2+ features.
+- This MVP focuses on token budget enforcement; it does not track cost or time.
+- Tools are intentionally minimal and run in-process.
+- SQLite checkpointer is used for LangGraph state persistence.
 
 ## License
 

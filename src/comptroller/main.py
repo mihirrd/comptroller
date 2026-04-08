@@ -94,16 +94,13 @@ def init():
 def run(
     task: Annotated[str, typer.Argument()] = None,
     session: Annotated[str, typer.Option("--session")] = None,
-    max_tokens: Annotated[int, typer.Option("--max-tokens")] = 100,
-    model: Annotated[str, typer.Option("--model")] = "gpt-4o",
+    max_tokens: Annotated[int, typer.Option("--max-tokens")] = os.getenv("max_tokens", 1000),
+    model: Annotated[str, typer.Option("--model")] = os.getenv("model", "gpt-4o"),
 ):
     """Run an agent task with token budget tracking. Supports continuous conversation mode."""
     from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
-    from budget import tokens_from_llm_message
-    from graph import build_graph
-
-    load_dotenv()  # Load .env file
-    logging_config.configure_logging()
+    from .budget import tokens_from_llm_message
+    from .graph import build_graph
     ui.print_banner()
 
     if not _available_llm_models():
@@ -198,53 +195,31 @@ def run(
             status = ui.console.status(f"[{ui.THEME['llm']}]● Working on it...[/]", spinner="dots")
             status.start()
 
-            logger.info(
-                "Graph stream start session_id=%s model=%s tokens_used=%s max_tokens=%s task=%r",
-                session_id,
-                model,
-                current_tokens,
-                max_tokens,
-                task,
-            )
-            logger.info(
-                "Initial messages for this turn (before system prompt in graph): %s",
-                _log_repr_preview(turn_state["messages"][0]),
-            )
-
             token_count = 0
             ai_message = ""
             budget_exhausted = False
             for chunk in graph.stream(turn_state, config, stream_mode=["messages", "updates"]):
                 mode, data = chunk
-                logger.debug("stream chunk mode=%s", mode)
                 if mode == "messages":
                     message_chunk, metadata = data
                     node = metadata.get("langgraph_node")
-                    logger.debug(
-                        "stream messages langgraph_node=%s chunk=%s",
-                        node,
-                        _log_repr_preview(message_chunk),
-                    )
 
                     # Stream text tokens live from agent node only
                     if node == "agent" and message_chunk.content:
                         ai_message += message_chunk.content
-                        # print(message_chunk.content, end="")
+                        print(message_chunk.content, end="")
                         token_count += 1
                     
-                    if token_count >= 5:
+                    if token_count >= max_tokens:
                         # Stop spinner after receiving some tokens
                         status.stop()
+                        budget_exhausted = True
+                        break
                 
                 elif mode == "updates":
                     if not isinstance(data, dict):
-                        logger.debug(
-                            "stream updates non-dict payload: %s",
-                            _log_repr_preview(data),
-                        )
                         continue
-                    logger.debug("stream updates node keys: %s", list(data.keys()))
-
+                    
                     for node_name, node_state in data.items():
                         final_state = node_state
 
@@ -295,7 +270,7 @@ def run(
                                                 break
 
                                         # Estimate tokens
-                                        from budget import count_tokens
+                                        from .budget import count_tokens
                                         tokens_this_step = count_tokens(content)
 
                                         ui.print_step_tool(step_counter, tool_name, tool_input, content, tokens_this_step)
@@ -431,4 +406,5 @@ def inspect(session: Annotated[str, typer.Option("--session")]):
 
 
 if __name__ == "__main__":
+    load_dotenv()
     app()
