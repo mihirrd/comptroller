@@ -3,11 +3,14 @@ import os
 import time
 import uuid
 from pathlib import Path
+
+import litellm
 import typer
 from typing_extensions import Annotated
 from graph import summarize_node
 import logging_config
 import store
+import tools as tools_mod
 import ui
 from dotenv import load_dotenv
 
@@ -188,6 +191,8 @@ def run(
 
             # Stream through graph and display outputs
             final_state = None
+            tools_mod.set_workspace_root_for_tools(turn_state["workspace_root"])
+
             # Show thinking animation at the start
             ui.console.print()
             status = ui.console.status(f"[{ui.THEME['llm']}]● Working on it...[/]", spinner="dots")
@@ -377,6 +382,19 @@ def run(
         ui.console.print("─" * 80)
         ui.console.print()
 
+    except litellm.RateLimitError:
+        ui.print_error(
+            "Rate limit exceeded after automatic retries with backoff. "
+            "Wait a few minutes, reduce how often you call the API, or check your provider quota."
+        )
+        logger.exception("LLM rate limit exhausted after retries")
+        raise typer.Exit(1)
+    except (litellm.APIConnectionError, litellm.Timeout, litellm.ServiceUnavailableError) as e:
+        ui.print_error(
+            f"Transient API error after retries: {e!s}. Check your network and try again."
+        )
+        logger.exception("LLM transient error exhausted retries")
+        raise typer.Exit(1)
     except Exception as e:
         ui.print_error(f"Error during execution: {str(e)}")
         raise typer.Exit(1)

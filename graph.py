@@ -1,7 +1,11 @@
 import logging
+import os
 import sqlite3
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
+
+import litellm
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -10,11 +14,13 @@ from langchain_litellm import ChatLiteLLM
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from state import AgentState
-from tools import TOOLS
+from tools import TOOLS, set_workspace_root_for_tools
 from budget import count_tokens, tokens_from_llm_message
 from prompt_builder import build_system_prompt
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 MAX_RECENT_FILES = 20
 MAX_TOOL_MSG_CHARS = 12_000
@@ -52,9 +58,70 @@ def _format_ai_response_for_log(response: Any) -> str:
     return "\n".join(lines)
 
 
+# Transient provider errors we backoff and retry (graph-level; avoids ChatLiteLLM default max_retries=1 = no retries).
+_LLM_TRANSIENT_EXCEPTIONS = (
+    litellm.RateLimitError,
+    litellm.Timeout,
+    litellm.APIConnectionError,
+    litellm.ServiceUnavailableError,
+    litellm.InternalServerError,
+    litellm.BadGatewayError,
+)
+
+
+def _llm_retry_attempts() -> int:
+    raw = os.environ.get("COMPTROLLER_LLM_RETRY_ATTEMPTS", "8")
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 8
+    return max(1, n)
+
+
+def _llm_backoff_seconds(attempt_index: int) -> float:
+    """Exponential backoff: base * 2^attempt, capped (attempt 0 = first retry wait)."""
+    try:
+        base = float(os.environ.get("COMPTROLLER_LLM_BACKOFF_BASE_SEC", "2.0"))
+    except ValueError:
+        base = 2.0
+    try:
+        cap = float(os.environ.get("COMPTROLLER_LLM_BACKOFF_MAX_SEC", "120.0"))
+    except ValueError:
+        cap = 120.0
+    delay = base * (2**attempt_index)
+    return min(cap, delay)
+
+
+def _invoke_with_transient_retries(fn: Callable[[], T], *, context: str) -> T:
+    """Run ``fn``; on rate limits and common transient API errors, sleep with exponential backoff and retry."""
+    attempts = _llm_retry_attempts()
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except _LLM_TRANSIENT_EXCEPTIONS as e:
+            if attempt >= attempts - 1:
+                logger.error("%s: failed after %s attempts: %s", context, attempts, e)
+                raise
+            delay = _llm_backoff_seconds(attempt)
+            logger.warning(
+                "%s: %s (attempt %s/%s); sleeping %.1fs then retrying",
+                context,
+                type(e).__name__,
+                attempt + 1,
+                attempts,
+                delay,
+            )
+            time.sleep(delay)
+    raise RuntimeError("_invoke_with_transient_retries: unreachable")
+
+
 def _chat(model: str, temperature: float = 0) -> ChatLiteLLM:
-    """LiteLLM-backed chat model; `model` uses LiteLLM naming (provider prefixes optional)."""
-    return ChatLiteLLM(model=model, temperature=temperature)
+    """LiteLLM-backed chat model; `model` uses LiteLLM naming (provider prefixes optional).
+
+    ``max_retries=1`` so LangChain's inner tenacity does not stack with
+    :func:`_invoke_with_transient_retries` (which applies backoff for rate limits and 5xx).
+    """
+    return ChatLiteLLM(model=model, temperature=temperature, max_retries=1)
 
 
 def _merge_recent_files(existing: list[str] | None, new_paths: list[str]) -> list[str]:
@@ -81,14 +148,48 @@ def _find_tool_call(msgs: list[Any], tool_call_id: str) -> tuple[str | None, dic
     return None, {}
 
 
-def _paths_from_tool_messages(msgs: list[Any], tool_messages: list[ToolMessage]) -> list[str]:
+def _paths_from_patch_text(patch_text: str) -> list[str]:
+    """Extract target file paths from a unified diff (+++ b/... lines)."""
+    out: list[str] = []
+    for line in patch_text.splitlines():
+        if not line.startswith("+++ "):
+            continue
+        rest = line[4:].strip()
+        if "dev/null" in rest:
+            continue
+        path_part = rest.split("\t", 1)[0].strip()
+        for prefix in ("b/", "a/"):
+            if path_part.startswith(prefix):
+                path_part = path_part[len(prefix) :]
+                break
+        if path_part and path_part != "/dev/null":
+            out.append(path_part)
+    return out
+
+
+def _paths_from_tool_messages(
+    state: AgentState,
+    msgs: list[Any],
+    tool_messages: list[ToolMessage],
+) -> list[str]:
     paths: list[str] = []
+    wr = Path(state["workspace_root"]).expanduser().resolve()
     for tm in tool_messages:
         tid = getattr(tm, "tool_call_id", None)
         if not tid:
             continue
         name, args = _find_tool_call(msgs, tid)
-        if name not in ("read_file", "write_file"):
+        if name == "apply_patch":
+            for p in _paths_from_patch_text(args.get("patch_text") or ""):
+                try:
+                    if os.path.isabs(p):
+                        paths.append(str(Path(p).expanduser().resolve()))
+                    else:
+                        paths.append(str((wr / p).resolve()))
+                except Exception:
+                    paths.append(p)
+            continue
+        if name not in ("read_file", "write_file", "search_replace"):
             continue
         raw = args.get("path")
         if not raw:
@@ -176,7 +277,10 @@ def agent_node(state: AgentState) -> AgentState:
     logger.info("LLM request messages:\n%s", _format_messages_for_log(messages_for_llm))
 
     # Call LLM (truncated tool bodies only in this copy)
-    response = llm_with_tools.invoke(messages_for_llm)
+    response = _invoke_with_transient_retries(
+        lambda: llm_with_tools.invoke(messages_for_llm),
+        context=f"LLM agent session_id={state['session_id']}",
+    )
 
     logger.info("LLM response session_id=%s", state["session_id"])
     logger.info("LLM response:\n%s", _format_ai_response_for_log(response))
@@ -250,7 +354,7 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
         new_state["status"] = "summarizing"
 
     tm_only = [m for m in tool_messages if isinstance(m, ToolMessage)]
-    new_paths = _paths_from_tool_messages(tool_result["messages"], tm_only)
+    new_paths = _paths_from_tool_messages(state, tool_result["messages"], tm_only)
     new_state["recent_files"] = _merge_recent_files(state.get("recent_files"), new_paths)
 
     return new_state
@@ -306,7 +410,10 @@ Tool calls made:
 
     # Call LLM for summary (does not check budget)
     llm = _chat(state["model"])
-    response = llm.invoke([HumanMessage(content=summary_prompt)])
+    response = _invoke_with_transient_retries(
+        lambda: llm.invoke([HumanMessage(content=summary_prompt)]),
+        context=f"LLM summarize session_id={state['session_id']}",
+    )
 
     summary = response.content if hasattr(response, "content") else str(response)
 
@@ -411,6 +518,8 @@ def run_graph(
     # Run graph
     config = {"configurable": {"thread_id": session_id}}
     final_state = None
+
+    set_workspace_root_for_tools(initial_state["workspace_root"])
 
     for state in graph.stream(initial_state, config):
         # Get the last state
