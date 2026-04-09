@@ -1,13 +1,17 @@
+import os
 import tempfile
 from pathlib import Path
 
 import pytest
 from unittest.mock import patch, MagicMock
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 
 from comptroller.graph import (
     MAX_TOOL_MSG_CHARS,
+    RECENT_FILES_CONTEXT_MSG_ID,
     _prepare_messages_for_llm,
+    _state_messages_with_sliding_window,
+    _trim_messages_window,
     after_tools_gate,
     agent_node,
     budget_gate,
@@ -386,3 +390,77 @@ def test_prepare_messages_truncates_long_tool_output():
     assert isinstance(out[1], ToolMessage)
     assert len(out[1].content) < len(long_body)
     assert "truncated" in out[1].content
+
+
+def test_trim_messages_window_keeps_system_and_tail():
+    sys = SystemMessage(content="sys")
+    tail = [HumanMessage(content=str(i)) for i in range(30)]
+    msgs = [sys] + tail
+    with patch.dict(os.environ, {"COMPTROLLER_MAX_MESSAGE_WINDOW": "10"}):
+        out = _trim_messages_window(msgs)
+    assert len(out) == 11
+    assert isinstance(out[0], SystemMessage)
+    assert out[1].content == "20"
+    assert out[-1].content == "29"
+
+
+def test_trim_messages_window_extends_back_over_leading_tool_message():
+    sys = SystemMessage(content="sys")
+    rest = (
+        [HumanMessage(content=str(i)) for i in range(25)]
+        + [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "list_directory", "args": {"path": "."}, "id": "a"}],
+            ),
+            ToolMessage(content="ok", tool_call_id="a"),
+        ]
+    )
+    msgs = [sys] + rest
+    with patch("comptroller.graph._max_message_window", return_value=2):
+        out = _trim_messages_window(msgs)
+    assert isinstance(out[1], AIMessage)
+    assert isinstance(out[2], ToolMessage)
+
+
+def test_state_messages_with_sliding_window_emits_remove_when_trimmed():
+    sys = SystemMessage(content="s")
+    tail = [HumanMessage(content=str(i)) for i in range(30)]
+    full = [sys] + tail
+    with patch.dict(os.environ, {"COMPTROLLER_MAX_MESSAGE_WINDOW": "10"}):
+        out = _state_messages_with_sliding_window(full)
+    assert isinstance(out[0], RemoveMessage)
+    assert len(out) == 12
+
+
+def test_agent_node_inserts_recent_files_context_for_llm():
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "do something",
+        "model": "gpt-4o",
+        "workspace_root": "/tmp/ws",
+        "messages": [HumanMessage(content="do something")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "running",
+        "summary": None,
+        "recent_files": ["/tmp/ws/foo.py"],
+    }
+    mock_response = AIMessage(content="done")
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+        agent_node(state)
+
+    sent = mock_llm.bind_tools.return_value.invoke.call_args[0][0]
+    ctx = next(m for m in sent if getattr(m, "id", None) == RECENT_FILES_CONTEXT_MSG_ID)
+    assert "/tmp/ws/foo.py" in ctx.content
+    assert "Recently touched files" in ctx.content

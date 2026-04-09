@@ -9,9 +9,10 @@ import litellm
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import ToolNode
 from langchain_litellm import ChatLiteLLM
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 
 from .state import AgentState
 from .tools import TOOLS, set_workspace_root_for_tools
@@ -25,6 +26,54 @@ T = TypeVar("T")
 MAX_RECENT_FILES = 20
 MAX_TOOL_MSG_CHARS = 12_000
 MAX_TOOL_DIGEST_ITEMS = 8
+DEFAULT_MAX_MESSAGE_WINDOW = 48
+RECENT_FILES_CONTEXT_MSG_ID = "comptroller-recent-files-context"
+
+
+def _max_message_window() -> int:
+    raw = os.environ.get("COMPTROLLER_MAX_MESSAGE_WINDOW", str(DEFAULT_MAX_MESSAGE_WINDOW))
+    try:
+        n = int(raw)
+    except ValueError:
+        n = DEFAULT_MAX_MESSAGE_WINDOW
+    return max(8, n)
+
+
+def _recent_files_context_block(paths: list[str] | None) -> str:
+    """Human-readable block injected each agent turn (not part of build_system_prompt)."""
+    header = "### Recently touched files (session)\n\n"
+    if not paths:
+        return header + "(none recorded yet)"
+    lines = "\n".join(f"- `{p}`" for p in paths)
+    return header + lines
+
+
+def _trim_messages_window(messages: list[Any]) -> list[Any]:
+    """Keep the system message (if any) and a bounded suffix of the rest; never split a leading tool run."""
+    if not messages:
+        return messages
+    limit = _max_message_window()
+    prefix: list[Any] = []
+    rest: list[Any]
+    if isinstance(messages[0], SystemMessage):
+        prefix = [messages[0]]
+        rest = list(messages[1:])
+    else:
+        rest = list(messages)
+    if len(rest) <= limit:
+        return messages
+    start = len(rest) - limit
+    while start > 0 and isinstance(rest[start], ToolMessage):
+        start -= 1
+    return prefix + rest[start:]
+
+
+def _state_messages_with_sliding_window(full_messages: list[Any]) -> list[Any]:
+    """Return value for ``messages`` state key: replace-all + trimmed list when over the window."""
+    trimmed = _trim_messages_window(full_messages)
+    if len(trimmed) >= len(full_messages):
+        return full_messages
+    return [RemoveMessage(id=REMOVE_ALL_MESSAGES), *trimmed]
 
 
 def _truncate(s: str, max_len: int = 6000) -> str:
@@ -295,7 +344,7 @@ def _prepare_messages_for_llm(messages: list[Any]) -> list[Any]:
 
 def agent_node(state: AgentState) -> AgentState:
     """Agent node - calls LLM with tools bound."""
-    # Build messages list
+    # Build messages list (recent-files context is injected here only, not persisted in state)
     messages = state["messages"].copy()
 
     prompt_state = dict(state)
@@ -305,6 +354,15 @@ def agent_node(state: AgentState) -> AgentState:
     if len(messages) == 0 or not isinstance(messages[0], SystemMessage):
         system_msg = SystemMessage(content=build_system_prompt(prompt_state))
         messages.insert(0, system_msg)
+
+    recent_ctx = HumanMessage(
+        content=_recent_files_context_block(state.get("recent_files")),
+        id=RECENT_FILES_CONTEXT_MSG_ID,
+    )
+    if messages and isinstance(messages[0], SystemMessage):
+        messages.insert(1, recent_ctx)
+    else:
+        messages.insert(0, recent_ctx)
 
     messages_for_llm = _prepare_messages_for_llm(messages)
 
@@ -340,7 +398,7 @@ def agent_node(state: AgentState) -> AgentState:
     new_state["tokens_used"] = state["tokens_used"] + tokens
     new_state["api_dollars_used"] = state["api_dollars_used"] + call_dollars
     new_state["wall_seconds_used"] = state["wall_seconds_used"] + _wall_dt
-    new_state["messages"] = state["messages"] + [response]
+    new_state["messages"] = _state_messages_with_sliding_window(state["messages"] + [response])
 
     cap = state.get("max_api_dollars")
     wcap = state.get("max_wall_seconds")
@@ -393,7 +451,7 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
     new_state = state.copy()
 
     # Update messages from tool execution
-    new_state["messages"] = tool_result["messages"]
+    new_state["messages"] = _state_messages_with_sliding_window(tool_result["messages"])
 
     # Count tokens in tool results
     tool_messages = [msg for msg in tool_result["messages"] if msg not in state["messages"]]

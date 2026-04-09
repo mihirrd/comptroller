@@ -7,10 +7,9 @@ from pathlib import Path
 import litellm
 import typer
 from typing_extensions import Annotated
-from .graph import SessionTransientRetryBudgetExhausted, summarize_node
+from .graph import SessionTransientRetryBudgetExhausted
 from . import logging_config
 from . import store
-from . import tools as tools_mod
 from . import ui
 from dotenv import load_dotenv
 
@@ -158,9 +157,10 @@ def run(
     model: Annotated[str, typer.Option("--model")] = os.getenv("model", "gpt-4o"),
 ):
     """Run an agent task with token, optional dollar, and optional wall-time budgets. Supports continuous conversation mode."""
-    from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
-    from .budget import tokens_from_llm_message
+    from langchain_core.messages import AIMessage, ToolMessage
+
     from .graph import build_graph
+    from .runner import AgentTurnInput, run_agent_turn
     load_dotenv()
     ui.print_banner()
 
@@ -282,7 +282,6 @@ def run(
     try:
         # Build graph
         graph = build_graph(db_path)
-        config = {"configurable": {"thread_id": session_id}}
 
         # Continuous conversation loop
         current_tokens = tokens_used_so_far
@@ -319,157 +318,82 @@ def run(
                     ui.console.print("[dim]Exiting session...[/dim]")
                     break
 
-            # Prepare state for this turn
-            turn_state = {
-                "session_id": session_id,
-                "task": task,
-                "model": model,
-                "workspace_root": str(Path.cwd()),
-                "messages": [HumanMessage(content=task)],
-                "tool_results": [],
-                "tokens_used": current_tokens,
-                "max_tokens": max_tokens,
-                "api_dollars_used": current_dollars,
-                "max_api_dollars": max_api_dollars,
-                "wall_seconds_used": current_wall_seconds,
-                "max_wall_seconds": max_wall_s,
-                "session_retries_used": current_session_retries,
-                "max_session_retries": session_retry_cap,
-                "status": "running",
-                "summary": None
-            }
+            turn_inp = AgentTurnInput(
+                task=task,
+                session_id=session_id,
+                model=model,
+                workspace_root=str(Path.cwd()),
+                tokens_used=current_tokens,
+                max_tokens=max_tokens,
+                api_dollars_used=current_dollars,
+                max_api_dollars=max_api_dollars,
+                wall_seconds_used=current_wall_seconds,
+                max_wall_seconds=max_wall_s,
+                session_retries_used=current_session_retries,
+                max_session_retries=session_retry_cap,
+            )
 
-            # Stream through graph and display outputs
-            final_state = None
-            tools_mod.set_workspace_root_for_tools(turn_state["workspace_root"])
-
-            # Show thinking animation at the start
             ui.console.print()
             status = ui.console.status(f"[{ui.THEME['llm']}]● Working on it...[/]", spinner="dots")
             status.start()
 
-            token_count = 0
-            ai_message = ""
-            budget_exhausted = False
-            for chunk in graph.stream(turn_state, config, stream_mode=["messages", "updates"]):
-                mode, data = chunk
-                if mode == "messages":
-                    message_chunk, metadata = data
-                    node = metadata.get("langgraph_node")
+            def _on_stream(chunk: str) -> None:
+                print(chunk, end="")
 
-                    # Stream text tokens live from agent node only
-                    if node == "agent" and message_chunk.content:
-                        ai_message += message_chunk.content
-                        print(message_chunk.content, end="")
-                        token_count += 1
-                    
-                    if token_count >= max_tokens:
-                        # Stop spinner after receiving some tokens
-                        status.stop()
-                        budget_exhausted = True
-                        break
-                
-                elif mode == "updates":
-                    if not isinstance(data, dict):
-                        continue
-                    
-                    for node_name, node_state in data.items():
-                        final_state = node_state
+            def _after_agent_llm(msg: AIMessage, step: int, est: int) -> None:
+                status.stop()
+                content = msg.content if msg.content else "[Tool calls]"
+                ui.print_step_llm(step, content, est)
+                if getattr(msg, "tool_calls", None):
+                    status.update(f"[{ui.THEME['tool']}]● Executing tools...[/]")
+                    status.start()
 
-                        # Display outputs based on node type
-                        if node_name == "agent":
-                            # Stop thinking spinner
-                            status.stop()
+            def _after_tool(
+                _msg: ToolMessage,
+                tool_name: str,
+                tool_input: dict,
+                content: str,
+                step: int,
+                est: int,
+            ) -> None:
+                status.stop()
+                ui.print_step_tool(step, tool_name, tool_input, content, est)
+                status.update(f"[{ui.THEME['llm']}]● Thinking...[/]")
+                status.start()
 
-                            # LLM response
-                            if node_state.get("messages"):
-                                last_msg = node_state["messages"][-1]
-                                if isinstance(last_msg, AIMessage):
-                                    step_counter += 1
-                                    content = last_msg.content if last_msg.content else "[Tool calls]"
-                                    tokens_this_step = tokens_from_llm_message(last_msg, model)
-                                    ui.print_step_llm(step_counter, content, tokens_this_step)
+            def _on_summarize_shown() -> None:
+                status.stop()
+                ui.print_summarizing()
 
-                                    # Log to database
-                                    store.log_step(session_id, step_counter, "llm_response", content, tokens_this_step, db_path)
-
-                                    # If agent called tools, show "Executing tools..." status
-                                    if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
-                                        status.update(f"[{ui.THEME['tool']}]● Executing tools...[/]")
-                                        status.start()
-
-                        elif node_name == "tools":
-                            # Stop tool execution spinner
-                            status.stop()
-
-                            # Tool execution
-                            if node_state.get("messages"):
-                                # Find tool messages
-                                for msg in reversed(node_state["messages"]):
-                                    if isinstance(msg, ToolMessage):
-                                        step_counter += 1
-                                        tool_name = msg.name if hasattr(msg, 'name') else "tool"
-                                        content = msg.content
-
-                                        # Get tool input from previous AI message
-                                        tool_input = {}
-                                        for prev_msg in reversed(node_state["messages"]):
-                                            if isinstance(prev_msg, AIMessage) and hasattr(prev_msg, 'tool_calls') and prev_msg.tool_calls:
-                                                for tc in prev_msg.tool_calls:
-                                                    if hasattr(msg, 'tool_call_id') and tc.get('id') == msg.tool_call_id:
-                                                        tool_input = tc.get('args', {})
-                                                        tool_name = tc.get('name', tool_name)
-                                                        break
-                                                break
-
-                                        # Estimate tokens
-                                        from .budget import count_tokens
-                                        tokens_this_step = count_tokens(content)
-
-                                        ui.print_step_tool(step_counter, tool_name, tool_input, content, tokens_this_step)
-
-                                        # Log to database
-                                        store.log_step(session_id, step_counter, "tool_call", f"{tool_name}: {content[:200]}", tokens_this_step, db_path)
-                                        break  # Only show the latest tool message
-
-                                # After tools, agent will think again
-                                status.update(f"[{ui.THEME['llm']}]● Thinking...[/]")
-                                status.start()
-
-                        if node_name == "summarize":
-                            # Stop spinner for summarization
-                            status.stop()
-
-                            # Show summarizing notice
-                            if node_state.get("status") == "complete":
-                                ui.print_summarizing()
-
-            # Make sure spinner is stopped at the end
             try:
-                status.stop()
-            except:
-                pass
+                result = run_agent_turn(
+                    turn_inp,
+                    db_path=db_path,
+                    graph=graph,
+                    callbacks={
+                        "on_streaming_llm_text": _on_stream,
+                        "after_agent_llm": _after_agent_llm,
+                        "after_tool": _after_tool,
+                        "on_summarize_shown": _on_summarize_shown,
+                    },
+                    log_steps_to_store=True,
+                    step_counter_start=step_counter,
+                )
+            finally:
+                try:
+                    status.stop()
+                except Exception:
+                    pass
 
-            if budget_exhausted:                
-                partial_state = {
-                    **turn_state,
-                    "messages": turn_state["messages"] + [AIMessage(content=ai_message)],
-                    "tokens_used": current_tokens + token_count,
-                    "api_dollars_used": current_dollars,
-                    "max_api_dollars": max_api_dollars,
-                    "wall_seconds_used": current_wall_seconds,
-                    "max_wall_seconds": max_wall_s,
-                    "session_retries_used": current_session_retries,
-                    "max_session_retries": session_retry_cap,
-                    "status": "summarizing"
-                }
-                summary_result = summarize_node(partial_state)
-                status.stop()
-                final_state = summary_result
-                current_tokens = partial_state["tokens_used"]
-                current_dollars = float(final_state.get("api_dollars_used", current_dollars))
-                current_wall_seconds = float(final_state.get("wall_seconds_used", current_wall_seconds))
-                current_session_retries = int(final_state.get("session_retries_used", current_session_retries))
+            step_counter = result.next_step_counter
+            final_state = result.final_state
+            streaming_budget_hit = result.streaming_token_budget_hit
+
+            if streaming_budget_hit:
+                current_tokens = result.current_tokens
+                current_dollars = result.current_dollars
+                current_wall_seconds = result.current_wall_seconds
+                current_session_retries = result.current_session_retries
                 ui.print_token_bar(
                     current_tokens,
                     max_tokens,
@@ -484,11 +408,10 @@ def run(
                 ui.print_error("Graph execution failed - no final state returned")
                 break
 
-            # Update current token count
-            current_tokens = final_state["tokens_used"]
-            current_dollars = float(final_state.get("api_dollars_used", current_dollars))
-            current_wall_seconds = float(final_state.get("wall_seconds_used", current_wall_seconds))
-            current_session_retries = int(final_state.get("session_retries_used", current_session_retries))
+            current_tokens = result.current_tokens
+            current_dollars = result.current_dollars
+            current_wall_seconds = result.current_wall_seconds
+            current_session_retries = result.current_session_retries
 
             # Print token bar after this turn
             ui.print_token_bar(

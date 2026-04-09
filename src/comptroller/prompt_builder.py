@@ -24,13 +24,6 @@ def _template_text() -> str:
     return _TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
-def _format_recent_files(paths: list[str] | None) -> str:
-    if not paths:
-        return "(none recorded yet)"
-    lines = [f"- `{p}`" for p in paths]
-    return "\n".join(lines)
-
-
 def _format_workspace(workspace_root: str | None) -> str:
     if workspace_root:
         return f"Working directory / workspace: `{workspace_root}`"
@@ -78,8 +71,7 @@ def build_system_prompt(
 ) -> str:
     """Build the system prompt from ``prompts/system.md`` and ``state``.
 
-    Recognized optional keys (future-proof for later todos): ``workspace_root``,
-    ``recent_files`` (list of paths), ``tool_digest`` (short string). Uses
+    Recognized optional keys: ``workspace_root``, ``tool_digest`` (short string). Uses
     ``state["model"]`` for tiktoken when counting tokens.
 
     Parameters
@@ -103,10 +95,6 @@ def build_system_prompt(
     if workspace_root is not None and not isinstance(workspace_root, str):
         workspace_root = str(workspace_root)
 
-    recent_files = state.get("recent_files")
-    if recent_files is not None and not isinstance(recent_files, list):
-        recent_files = None
-
     tool_digest = state.get("tool_digest")
     if tool_digest is not None and not isinstance(tool_digest, str):
         tool_digest = str(tool_digest)
@@ -114,7 +102,6 @@ def build_system_prompt(
     replacements: dict[str, str] = {
         "task": str(task).strip(),
         "workspace_root": _format_workspace(workspace_root),
-        "recent_files": _format_recent_files(recent_files),
         "tool_catalog": _format_tool_catalog(),
         "tool_digest": _format_tool_digest(tool_digest),
     }
