@@ -1,0 +1,9 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.pyc
+predictions.jsonl
+predictions.*.jsonl
+logs/
+*.egg-info/
+dist/

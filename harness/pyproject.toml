@@ -1,0 +1,33 @@
+[project]
+name = "comptroller-harness"
+version = "0.1.0"
+description = "SWE-bench Lite harness for Comptroller (eval infra + inference CLI)."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "comptroller",
+    "datasets>=3.0.0",
+    "docker>=7.0.0",
+    "typer>=0.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9"]
+
+[project.scripts]
+comptroller-swebench = "comptroller_swebench.cli:main"
+comptroller-swebench-clone-run = "comptroller_swebench.clone_workflow:main"
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.uv.sources]
+comptroller = { path = "..", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

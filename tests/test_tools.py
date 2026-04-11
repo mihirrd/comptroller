@@ -64,6 +64,26 @@ def test_workspace_jail_blocks_escape():
         assert "escapes workspace_root" in out
 
 
+def test_relative_path_resolves_under_workspace_not_cwd():
+    """Regression: relative tool paths must not use process cwd when jail is set."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "ws"
+        target = root / "pkg" / "mod.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("hello\n")
+        other_cwd = Path(d) / "other_cwd"
+        other_cwd.mkdir()
+        set_workspace_root_for_tools(str(root))
+        old = os.getcwd()
+        try:
+            os.chdir(other_cwd)
+            out = read_file.invoke({"path": "pkg/mod.py"})
+        finally:
+            os.chdir(old)
+        assert "hello" in out
+        assert "escapes workspace_root" not in out
+
+
 def test_grep_finds_pattern():
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "a.py"

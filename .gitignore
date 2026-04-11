@@ -9,5 +9,6 @@ wheels/
 
 # Virtual environments
 .venv/
+.uv-cache/
 .env
 logs.txt

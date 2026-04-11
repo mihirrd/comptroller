@@ -52,12 +52,21 @@ def _configured_workspace_root() -> Path | None:
 
 
 def _resolve_path(path: str) -> tuple[Path | None, str | None]:
-    """Resolve path and enforce workspace jail when WORKSPACE_ROOT_ENV is set."""
+    """Resolve path and enforce workspace jail when WORKSPACE_ROOT_ENV is set.
+
+    Relative paths are resolved against the configured workspace root, not
+    ``os.getcwd()``, so tools work when the process cwd differs from the repo
+    (e.g. SWE-bench harness run from ``harness/`` while ``workspace_root`` is a temp clone).
+    """
+    root = _configured_workspace_root()
     try:
-        p = Path(path).expanduser().resolve()
+        raw = Path(path).expanduser()
+        if root is not None and not raw.is_absolute():
+            p = (root / raw).resolve()
+        else:
+            p = raw.resolve()
     except Exception as e:
         return None, f"Error resolving path {path!r}: {e}"
-    root = _configured_workspace_root()
     if root is not None:
         try:
             p.relative_to(root)
