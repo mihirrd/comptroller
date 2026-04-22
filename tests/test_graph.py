@@ -249,6 +249,44 @@ def test_dollar_budget_exceeded_triggers_summarize():
     assert dollars_from_llm_message(mock_response, "gpt-4o") > 0
 
 
+def test_token_budget_exceeded_with_local_fallback_degrades_model():
+    """When token budget is exceeded and local OpenAI URL + model id are set, switch model and keep running."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "test task",
+        "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 1,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "running",
+        "summary": None,
+        "local_model_url": "http://127.0.0.1:11434/v1",
+        "local_model_id": "llama3.2",
+        "model_degraded": False,
+    }
+    mock_response = AIMessage(content="x")
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        result = agent_node(state)
+
+    assert result["status"] == "running"
+    assert result.get("model_degraded") is True
+    assert result["model"] == "openai/llama3.2"
+    assert result["local_model_url"] == "http://127.0.0.1:11434/v1"
+    assert budget_gate(result) == "end"
+
+
 def test_budget_exceeded_triggers_summarize():
     """With token budget set to 1, graph routes to summarize node."""
     state: AgentState = {

@@ -59,6 +59,9 @@ class AgentTurnInput:
     session_retries_used: int = 0
     max_session_retries: int | None = None
     recent_files: list[str] | None = None
+    local_model_url: str | None = None
+    local_model_id: str | None = None
+    model_degraded: bool = False
 
 
 @dataclass
@@ -100,6 +103,9 @@ def _build_turn_state(inp: AgentTurnInput) -> dict[str, Any]:
         "max_session_retries": inp.max_session_retries,
         "status": "running",
         "summary": None,
+        "local_model_url": inp.local_model_url,
+        "local_model_id": inp.local_model_id,
+        "model_degraded": inp.model_degraded,
     }
     if inp.recent_files is not None:
         state["recent_files"] = list(inp.recent_files)
@@ -260,6 +266,9 @@ def run_agent_turn(
             "session_retries_used": inp.session_retries_used,
             "max_session_retries": inp.max_session_retries,
             "status": "summarizing",
+            "local_model_url": inp.local_model_url,
+            "local_model_id": inp.local_model_id,
+            "model_degraded": inp.model_degraded,
         }
         summary_result = summarize_node(partial_state)
         final_state = summary_result

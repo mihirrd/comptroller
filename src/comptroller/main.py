@@ -128,6 +128,26 @@ def _max_session_retries_from_env() -> int | None:
     return n if n >= 0 else None
 
 
+def _resolve_local_model_url(cli: str | None, session_val: str | None = None) -> str | None:
+    for candidate in (cli, session_val, os.environ.get("COMPTROLLER_LOCAL_MODEL_URL")):
+        if candidate is None:
+            continue
+        s = str(candidate).strip()
+        if s:
+            return s
+    return None
+
+
+def _resolve_local_model_id(cli: str | None, session_val: str | None = None) -> str | None:
+    for candidate in (cli, session_val, os.environ.get("COMPTROLLER_LOCAL_MODEL")):
+        if candidate is None:
+            continue
+        s = str(candidate).strip()
+        if s:
+            return s
+    return None
+
+
 @app.command()
 def run(
     task: Annotated[str, typer.Argument()] = None,
@@ -155,6 +175,21 @@ def run(
         ),
     ] = None,
     model: Annotated[str, typer.Option("--model")] = os.getenv("model", "gpt-4o"),
+    local_model_url: Annotated[
+        str | None,
+        typer.Option(
+            "--local-model-url",
+            help="OpenAI-compatible API base when cloud token/dollar budget is exceeded (e.g. http://localhost:11434/v1). "
+            "Also COMPTROLLER_LOCAL_MODEL_URL.",
+        ),
+    ] = None,
+    local_model_id: Annotated[
+        str | None,
+        typer.Option(
+            "--local-model",
+            help="Model name on the local server (required with --local-model-url). Also COMPTROLLER_LOCAL_MODEL.",
+        ),
+    ] = None,
 ):
     """Run an agent task with token, optional dollar, and optional wall-time budgets. Supports continuous conversation mode."""
     from langchain_core.messages import AIMessage, ToolMessage
@@ -183,6 +218,11 @@ def run(
 
     db_path = str(Path(DB_PATH).expanduser())
 
+    effective_model = model
+    model_degraded_loop = False
+    loc_url: str | None = None
+    loc_id: str | None = None
+
     # Resume existing session or create new one
     if session:
         # Resume existing session
@@ -207,11 +247,21 @@ def run(
         if resumed_max_session_retries is not None:
             session_retry_cap = int(resumed_max_session_retries)
 
-        if tokens_used_so_far >= max_tokens:
+        loc_url = _resolve_local_model_url(local_model_url, session_data.get("local_model_url"))
+        loc_id = _resolve_local_model_id(local_model_id, session_data.get("local_model_id"))
+        model_degraded_loop = bool(int(session_data.get("model_degraded") or 0))
+        effective_model = (session_data.get("active_model") or model).strip() or model
+        if model_degraded_loop and (not loc_url or not loc_id):
+            ui.print_error(
+                f"Session {session_id} is marked as using a local model, but local URL or model id is missing."
+            )
+            raise typer.Exit(1)
+
+        if tokens_used_so_far >= max_tokens and not model_degraded_loop:
             ui.print_error(f"Session {session_id} has exceeded token budget of {max_tokens:,}")
             ui.console.print("[dim]Please reset the session")
             raise typer.Exit(1)
-        if max_api_dollars is not None and dollars_used_so_far >= max_api_dollars:
+        if max_api_dollars is not None and dollars_used_so_far >= max_api_dollars and not model_degraded_loop:
             ui.print_error(
                 f"Session {session_id} has exceeded API dollar budget "
                 f"(${dollars_used_so_far:.4f} / ${max_api_dollars:.4f})"
@@ -250,6 +300,15 @@ def run(
             ui.print_error("Task required for new session. Use: python main.py run \"your task\"")
             raise typer.Exit(1)
 
+        loc_url = _resolve_local_model_url(local_model_url, None)
+        loc_id = _resolve_local_model_id(local_model_id, None)
+        if (loc_url and not loc_id) or (loc_id and not loc_url):
+            ui.print_error(
+                "Local model fallback requires both --local-model-url and --local-model "
+                "(or COMPTROLLER_LOCAL_MODEL_URL and COMPTROLLER_LOCAL_MODEL)."
+            )
+            raise typer.Exit(1)
+
         session_id = str(uuid.uuid4())[:8]
         tokens_used_so_far = 0
         dollars_used_so_far = 0.0
@@ -263,6 +322,10 @@ def run(
             max_api_dollars=max_api_dollars,
             max_wall_seconds=max_wall_s,
             max_session_retries=session_retry_cap,
+            primary_model=model,
+            active_model=model,
+            local_model_url=loc_url,
+            local_model_id=loc_id,
         )
 
         # Print session header
@@ -273,6 +336,8 @@ def run(
             max_tokens,
             max_api_dollars=max_api_dollars,
             max_wall_seconds=max_wall_s,
+            local_model_url=loc_url,
+            local_model_id=loc_id,
         )
 
     # Track start time
@@ -318,10 +383,12 @@ def run(
                     ui.console.print("[dim]Exiting session...[/dim]")
                     break
 
+            prev_degraded = model_degraded_loop
+
             turn_inp = AgentTurnInput(
                 task=task,
                 session_id=session_id,
-                model=model,
+                model=effective_model,
                 workspace_root=str(Path.cwd()),
                 tokens_used=current_tokens,
                 max_tokens=max_tokens,
@@ -331,6 +398,9 @@ def run(
                 max_wall_seconds=max_wall_s,
                 session_retries_used=current_session_retries,
                 max_session_retries=session_retry_cap,
+                local_model_url=loc_url,
+                local_model_id=loc_id,
+                model_degraded=model_degraded_loop,
             )
 
             ui.console.print()
@@ -413,6 +483,9 @@ def run(
             current_wall_seconds = result.current_wall_seconds
             current_session_retries = result.current_session_retries
 
+            effective_model = str(final_state.get("model") or effective_model)
+            model_degraded_loop = bool(final_state.get("model_degraded"))
+
             # Print token bar after this turn
             ui.print_token_bar(
                 current_tokens,
@@ -433,14 +506,27 @@ def run(
                 current_wall_seconds,
                 current_session_retries,
                 db_path,
+                active_model=effective_model,
+                model_degraded=model_degraded_loop,
+                local_model_url=loc_url,
+                local_model_id=loc_id,
             )
 
-            # Check if budget exceeded or summarizing
+            if model_degraded_loop and not prev_degraded:
+                ui.print_local_model_fallback(loc_url or "", effective_model)
+
+            # Check if budget exceeded or summarizing (local fallback keeps the session open)
+            degraded_now = model_degraded_loop
             budget_hit = (
-                final_state["status"] == "summarizing"
-                or current_tokens >= max_tokens
-                or (max_api_dollars is not None and current_dollars >= max_api_dollars)
+                final_state["status"] in ("summarizing", "complete")
                 or (max_wall_s is not None and current_wall_seconds >= max_wall_s)
+                or (
+                    not degraded_now
+                    and (
+                        current_tokens >= max_tokens
+                        or (max_api_dollars is not None and current_dollars >= max_api_dollars)
+                    )
+                )
             )
             if budget_hit:
                 ui.console.print()

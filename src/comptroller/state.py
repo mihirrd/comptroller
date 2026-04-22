@@ -21,3 +21,7 @@ class AgentState(TypedDict):
     status: str  # "running" | "summarizing" | "complete"
     summary: str | None
     recent_files: NotRequired[list[str]]  # paths touched by tools; shown via per-turn context message, not system prompt
+    # OpenAI-compatible local server (LiteLLM openai/* + api_base); used when cloud token/dollar budget is exceeded.
+    local_model_url: NotRequired[str | None]
+    local_model_id: NotRequired[str | None]  # model name on that server (e.g. llama3.2)
+    model_degraded: NotRequired[bool]  # True after switching from primary to local endpoint

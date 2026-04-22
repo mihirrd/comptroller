@@ -208,13 +208,84 @@ def _invoke_with_transient_retries(
     raise RuntimeError("_invoke_with_transient_retries: unreachable")
 
 
-def _chat(model: str, temperature: float = 0) -> ChatLiteLLM:
+def _litellm_openai_compatible_model(local_model_id: str) -> str:
+    """LiteLLM id for an OpenAI-compatible ``api_base`` (Ollama, LM Studio, vLLM, etc.)."""
+    lid = local_model_id.strip()
+    if lid.startswith("openai/"):
+        return lid
+    return f"openai/{lid}"
+
+
+def _api_base_for_llm(state: AgentState) -> str | None:
+    if not state.get("model_degraded"):
+        return None
+    url = (state.get("local_model_url") or "").strip().rstrip("/")
+    return url or None
+
+
+def _chat(
+    model: str,
+    temperature: float = 0,
+    *,
+    api_base: str | None = None,
+) -> ChatLiteLLM:
     """LiteLLM-backed chat model; `model` uses LiteLLM naming (provider prefixes optional).
+
+    When ``api_base`` is set (local OpenAI-compatible server), ``api_key`` defaults to
+    ``COMPTROLLER_LOCAL_API_KEY`` or the placeholder ``dummy`` (Ollama/LM Studio).
 
     ``max_retries=1`` so LangChain's inner tenacity does not stack with
     :func:`_invoke_with_transient_retries` (which applies backoff for rate limits and 5xx).
     """
-    return ChatLiteLLM(model=model, temperature=temperature, max_retries=1)
+    kwargs: dict[str, Any] = {"model": model, "temperature": temperature, "max_retries": 1}
+    if api_base:
+        kwargs["api_base"] = api_base.rstrip("/")
+        key = (os.environ.get("COMPTROLLER_LOCAL_API_KEY") or "").strip() or "dummy"
+        kwargs["api_key"] = key
+    return ChatLiteLLM(**kwargs)
+
+
+def _degradation_configured(state: AgentState) -> bool:
+    url = (state.get("local_model_url") or "").strip()
+    mid = (state.get("local_model_id") or "").strip()
+    return bool(url and mid and not state.get("model_degraded"))
+
+
+def _apply_model_degradation(new_state: AgentState, prev_state: AgentState) -> None:
+    url = (prev_state.get("local_model_url") or "").strip().rstrip("/")
+    mid = (prev_state.get("local_model_id") or "").strip()
+    new_state["model"] = _litellm_openai_compatible_model(mid)
+    new_state["local_model_url"] = url
+    new_state["local_model_id"] = mid
+    new_state["model_degraded"] = True
+    new_state["status"] = "running"
+    logger.info(
+        "Model degradation: using local OpenAI-compatible endpoint api_base=%s litellm_model=%s",
+        url,
+        new_state["model"],
+    )
+
+
+def _apply_budget_exceeded_status(new_state: AgentState, prev_state: AgentState) -> None:
+    """Set ``summarizing`` when a hard budget is hit, or switch to local LLM if configured (token/dollar only)."""
+    degraded = bool(prev_state.get("model_degraded"))
+    wcap = prev_state.get("max_wall_seconds")
+    if wcap is not None and new_state["wall_seconds_used"] >= wcap:
+        new_state["status"] = "summarizing"
+        return
+
+    token_exceeded = new_state["tokens_used"] >= prev_state["max_tokens"]
+    cap = prev_state.get("max_api_dollars")
+    dollar_exceeded = cap is not None and new_state["api_dollars_used"] >= cap
+
+    if degraded:
+        return
+
+    if token_exceeded or dollar_exceeded:
+        if _degradation_configured(prev_state):
+            _apply_model_degradation(new_state, prev_state)
+        else:
+            new_state["status"] = "summarizing"
 
 
 def _merge_recent_files(existing: list[str] | None, new_paths: list[str]) -> list[str]:
@@ -367,7 +438,7 @@ def agent_node(state: AgentState) -> AgentState:
     messages_for_llm = _prepare_messages_for_llm(messages)
 
     # Initialize LLM with tools
-    llm = _chat(state["model"])
+    llm = _chat(state["model"], api_base=_api_base_for_llm(state))
     llm_with_tools = llm.bind_tools(TOOLS)
 
     logger.info(
@@ -403,10 +474,11 @@ def agent_node(state: AgentState) -> AgentState:
     cap = state.get("max_api_dollars")
     wcap = state.get("max_wall_seconds")
     logger.info(
-        "LLM exchange session_id=%s model=%s tokens_this_call=%s tokens_used_total=%s max_tokens=%s "
+        "LLM exchange session_id=%s model=%s degraded=%s tokens_this_call=%s tokens_used_total=%s max_tokens=%s "
         "dollars_this_call=%.6f api_dollars_total=%.6f max_api_dollars=%s wall_step=%.3fs wall_total=%.3fs max_wall=%s",
         state["session_id"],
         state["model"],
+        bool(state.get("model_degraded")),
         tokens,
         new_state["tokens_used"],
         state["max_tokens"],
@@ -418,13 +490,7 @@ def agent_node(state: AgentState) -> AgentState:
         wcap,
     )
 
-    # Check if budget exceeded
-    if new_state["tokens_used"] >= state["max_tokens"]:
-        new_state["status"] = "summarizing"
-    if cap is not None and new_state["api_dollars_used"] >= cap:
-        new_state["status"] = "summarizing"
-    if wcap is not None and new_state["wall_seconds_used"] >= wcap:
-        new_state["status"] = "summarizing"
+    _apply_budget_exceeded_status(new_state, state)
 
     return new_state
 
@@ -473,12 +539,14 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
     new_state["tokens_used"] = state["tokens_used"] + total_tokens
     new_state["wall_seconds_used"] = state["wall_seconds_used"] + _wall_dt
 
-    # Check if budget exceeded
-    if new_state["tokens_used"] >= state["max_tokens"]:
-        new_state["status"] = "summarizing"
     wcap = state.get("max_wall_seconds")
     if wcap is not None and new_state["wall_seconds_used"] >= wcap:
         new_state["status"] = "summarizing"
+    elif not state.get("model_degraded") and new_state["tokens_used"] >= state["max_tokens"]:
+        if _degradation_configured(state):
+            _apply_model_degradation(new_state, state)
+        else:
+            new_state["status"] = "summarizing"
 
     tm_only = [m for m in tool_messages if isinstance(m, ToolMessage)]
     new_paths = _paths_from_tool_messages(state, tool_result["messages"], tm_only)
@@ -536,7 +604,7 @@ Tool calls made:
     logger.info("Summarize prompt:\n%s", _truncate(summary_prompt, 8000))
 
     # Call LLM for summary (does not check token/dollar budget; wall time still accumulates)
-    llm = _chat(state["model"])
+    llm = _chat(state["model"], api_base=_api_base_for_llm(state))
     _t_wall = time.monotonic()
     response = _invoke_with_transient_retries(
         lambda: llm.invoke([HumanMessage(content=summary_prompt)]),
@@ -637,6 +705,10 @@ def run_graph(
     max_api_dollars: float | None = None,
     max_wall_seconds: float | None = None,
     max_session_retries: int | None = None,
+    *,
+    local_model_url: str | None = None,
+    local_model_id: str | None = None,
+    model_degraded: bool = False,
 ):
     """Run the graph and return final state."""
     graph = build_graph(db_path)
@@ -660,6 +732,9 @@ def run_graph(
         "status": "running",
         "summary": None,
         "recent_files": [],
+        "local_model_url": local_model_url,
+        "local_model_id": local_model_id,
+        "model_degraded": model_degraded,
     }
 
     # Run graph

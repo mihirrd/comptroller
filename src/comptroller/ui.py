@@ -49,6 +49,8 @@ def print_session_header(
     *,
     max_api_dollars: float | None = None,
     max_wall_seconds: float | None = None,
+    local_model_url: str | None = None,
+    local_model_id: str | None = None,
 ):
     """Print session header before execution."""
     lines = [
@@ -57,6 +59,11 @@ def print_session_header(
         f"[bold]Model:[/bold] {model}",
         f"[bold]Max Tokens:[/bold] {max_tokens:,}",
     ]
+    if local_model_url and local_model_id:
+        lines.append(
+            f"[bold]Local fallback:[/bold] {local_model_id} @ {local_model_url} "
+            f"(used if token or API dollar budget is exceeded)"
+        )
     if max_api_dollars is not None:
         lines.append(f"[bold]Max API spend (est.):[/bold] ${max_api_dollars:.4f} USD (LiteLLM pricing)")
     if max_wall_seconds is not None:
@@ -174,6 +181,21 @@ def print_token_bar(
     console.print()
 
 
+def print_local_model_fallback(api_base: str, litellm_model: str) -> None:
+    """Notify that the session switched to the configured OpenAI-compatible endpoint."""
+    console.print()
+    console.print(
+        Panel(
+            f"Cloud token or dollar budget was reached.\n"
+            f"Continuing on local model [bold]{litellm_model}[/] at [bold]{api_base}[/].\n"
+            f"[dim]Wall-time budget (if any) still applies.[/dim]",
+            title=f"[{THEME['warning']}]Model fallback[/]",
+            border_style=THEME["warning"],
+        )
+    )
+    console.print()
+
+
 def print_summarizing(reason: str = "Token budget exceeded"):
     """Print notice that summarization is starting."""
     console.print(Panel(
@@ -275,12 +297,22 @@ def print_inspect(session: dict, steps: list[dict]):
         retry_line = f"\n[bold]LLM backoff retries:[/bold] {rused} / {int(rcap)}"
     elif rused > 0:
         retry_line = f"\n[bold]LLM backoff retries used:[/bold] {rused}"
+    am = session.get("active_model") or session.get("primary_model")
+    model_line = f"\n[bold]Active model:[/bold] {am}" if am else ""
+    degraded = int(session.get("model_degraded") or 0)
+    loc_u = session.get("local_model_url")
+    loc_i = session.get("local_model_id")
+    local_line = ""
+    if loc_u and loc_i:
+        local_line = f"\n[bold]Local fallback:[/bold] {loc_i} @ {loc_u}"
+    if degraded:
+        local_line += "\n[bold]Model mode:[/bold] local fallback (after cloud budget)"
     console.print(Panel(
         f"[bold]Session ID:[/bold] {session['session_id']}\n"
         f"[bold]Task:[/bold] {session['task']}\n"
         f"[bold]Status:[/bold] {session['status']}\n"
         f"[bold]Tokens:[/bold] {session['tokens_used']:,} / {session['max_tokens']:,}"
-        f"{dollar_line}{wall_line}{retry_line}\n"
+        f"{dollar_line}{wall_line}{retry_line}{model_line}{local_line}\n"
         f"[bold]Created:[/bold] {datetime.fromtimestamp(session['created_at']).strftime('%Y-%m-%d %H:%M:%S')}",
         title="[bold]Session Details[/bold]",
         border_style=THEME["accent"]

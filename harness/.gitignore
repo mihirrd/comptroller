@@ -7,3 +7,5 @@ predictions.*.jsonl
 logs/
 *.egg-info/
 dist/
+eval/
+.DS_Store

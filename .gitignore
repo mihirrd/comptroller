@@ -12,3 +12,7 @@ wheels/
 .uv-cache/
 .env
 logs.txt
+
+# Local files
+.DS_Store
+

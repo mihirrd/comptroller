@@ -22,6 +22,16 @@ def _migrate_sessions_schema(conn: sqlite3.Connection) -> None:
         cursor.execute("ALTER TABLE sessions ADD COLUMN session_retries_used INTEGER NOT NULL DEFAULT 0")
     if "max_session_retries" not in cols:
         cursor.execute("ALTER TABLE sessions ADD COLUMN max_session_retries INTEGER")
+    if "primary_model" not in cols:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN primary_model TEXT")
+    if "active_model" not in cols:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN active_model TEXT")
+    if "model_degraded" not in cols:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN model_degraded INTEGER NOT NULL DEFAULT 0")
+    if "local_model_url" not in cols:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN local_model_url TEXT")
+    if "local_model_id" not in cols:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN local_model_id TEXT")
     conn.commit()
 
 
@@ -95,6 +105,10 @@ def create_session(
     max_api_dollars: float | None = None,
     max_wall_seconds: float | None = None,
     max_session_retries: int | None = None,
+    primary_model: str | None = None,
+    active_model: str | None = None,
+    local_model_url: str | None = None,
+    local_model_id: str | None = None,
 ):
     """Create a new session."""
     db_path = str(Path(db_path).expanduser())
@@ -102,21 +116,27 @@ def create_session(
     cursor = conn.cursor()
 
     now = time.time()
+    pm = primary_model or active_model
+    am = active_model or primary_model
     cursor.execute("""
         INSERT INTO sessions (
             session_id, task, status, tokens_used, max_tokens,
             api_dollars_used, max_api_dollars,
             wall_seconds_used, max_wall_seconds,
             session_retries_used, max_session_retries,
-            summary, created_at, updated_at
+            summary, created_at, updated_at,
+            primary_model, active_model, model_degraded,
+            local_model_url, local_model_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         session_id, task, "running", 0, max_tokens,
         0.0, max_api_dollars,
         0.0, max_wall_seconds,
         0, max_session_retries,
         None, now, now,
+        pm, am, 0,
+        local_model_url, local_model_id,
     ))
 
     conn.commit()
@@ -148,6 +168,11 @@ def update_session(
     wall_seconds_used: float,
     session_retries_used: int,
     db_path: str = "~/.agent-runtime-mvp/sessions.db",
+    *,
+    active_model: str | None = None,
+    model_degraded: bool = False,
+    local_model_url: str | None = None,
+    local_model_id: str | None = None,
 ):
     """Update session status, token usage, dollar spend, wall time, retry count, and summary."""
     db_path = str(Path(db_path).expanduser())
@@ -157,11 +182,14 @@ def update_session(
     cursor.execute("""
         UPDATE sessions
         SET status = ?, tokens_used = ?, api_dollars_used = ?, wall_seconds_used = ?,
-            session_retries_used = ?, summary = ?, updated_at = ?
+            session_retries_used = ?, summary = ?, updated_at = ?,
+            active_model = ?, model_degraded = ?, local_model_url = ?, local_model_id = ?
         WHERE session_id = ?
     """, (
         status, tokens_used, api_dollars_used, wall_seconds_used,
-        session_retries_used, summary, time.time(), session_id,
+        session_retries_used, summary, time.time(),
+        active_model, 1 if model_degraded else 0, local_model_url, local_model_id,
+        session_id,
     ))
 
     conn.commit()
