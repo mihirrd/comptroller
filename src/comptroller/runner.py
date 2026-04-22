@@ -189,6 +189,23 @@ def run_agent_turn(
         cfg["checkpoint_ns"] = inp.resume_langgraph_checkpoint_ns
     config: dict[str, Any] = {"configurable": cfg}
 
+    # Persisted channel: re-inject recent_files from the head checkpoint so a new
+    # turn's partial update does not drop them when omitted from _build_turn_state.
+    if inp.recent_files is None:
+        try:
+            snap = compiled.get_state(config)
+            vals = snap.values
+            if isinstance(vals, dict):
+                prev = vals.get("recent_files")
+                if isinstance(prev, list) and len(prev) > 0:
+                    turn_state["recent_files"] = list(prev)
+        except Exception:
+            logger.debug(
+                "recent_files: could not read from checkpointer (session=%s)",
+                inp.session_id,
+                exc_info=True,
+            )
+
     final_state: dict[str, Any] | None = None
     step_counter = step_counter_start
     token_count = 0

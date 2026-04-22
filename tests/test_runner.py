@@ -51,4 +51,43 @@ def test_run_agent_turn_no_updates_returns_none_state():
     assert out.final_state is None
     assert out.streaming_token_budget_hit is False
     mock_graph.stream.assert_called_once()
-    mock_graph.get_state.assert_called_once()
+    # rehydrate recent_files (skipped when list empty) + _read_langgraph_checkpoint
+    assert mock_graph.get_state.call_count == 2
+
+
+def test_run_agent_turn_rehydrates_recent_files_from_checkpointer():
+    """When input omits recent_files, copy non-empty list from get_state before stream."""
+    mock_graph = MagicMock()
+    mock_graph.stream.return_value = iter([])
+
+    snap_for_files = MagicMock()
+    snap_for_files.config = {"configurable": {"thread_id": "s1"}}
+    snap_for_files.values = {"recent_files": ["/a.py"]}
+    snap_for_lg = MagicMock()
+    snap_for_lg.config = {"configurable": {"checkpoint_id": "ck1", "checkpoint_ns": ""}}
+    mock_graph.get_state.side_effect = [snap_for_files, snap_for_lg]
+
+    inp = AgentTurnInput(task="hello", session_id="s1", max_tokens=1000)
+    run_agent_turn(inp, db_path=":memory:", graph=mock_graph, log_steps_to_store=False)
+
+    stream_args = mock_graph.stream.call_args[0]
+    assert stream_args[0].get("recent_files") == ["/a.py"]
+
+
+def test_run_agent_turn_empty_recent_files_in_checkpoint_does_not_inject():
+    """Explicit empty checkpoint list does not set turn_state (no second source of truth)."""
+    mock_graph = MagicMock()
+    mock_graph.stream.return_value = iter([])
+
+    snap_for_files = MagicMock()
+    snap_for_files.config = {"configurable": {"thread_id": "s1"}}
+    snap_for_files.values = {"recent_files": []}
+    snap_for_lg = MagicMock()
+    snap_for_lg.config = {"configurable": {"checkpoint_id": "ck1", "checkpoint_ns": ""}}
+    mock_graph.get_state.side_effect = [snap_for_files, snap_for_lg]
+
+    inp = AgentTurnInput(task="hello", session_id="s1", max_tokens=1000)
+    run_agent_turn(inp, db_path=":memory:", graph=mock_graph, log_steps_to_store=False)
+
+    stream_args = mock_graph.stream.call_args[0]
+    assert "recent_files" not in stream_args[0]

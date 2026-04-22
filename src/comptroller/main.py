@@ -519,13 +519,25 @@ def run(
             status = ui.console.status(f"[{ui.THEME['llm']}]● Working on it...[/]", spinner="dots")
             status.start()
 
+            # If the graph streams LLM chunks, we show them with Rich styling; skip duplicating
+            # the same text in a Panel in print_step_llm (notably on resume, chunks replay in bulk).
+            llm_streamed_had_chunks: list[bool] = [False]
+
             def _on_stream(chunk: str) -> None:
-                print(chunk, end="")
+                llm_streamed_had_chunks[0] = True
+                ui.print_llm_stream_chunk(ui.console, chunk)
 
             def _after_agent_llm(msg: AIMessage, step: int, est: int) -> None:
                 status.stop()
                 content = msg.content if msg.content else "[Tool calls]"
-                ui.print_step_llm(step, content, est)
+                show_panel_body = not llm_streamed_had_chunks[0]
+                llm_streamed_had_chunks[0] = False
+                ui.print_step_llm(
+                    step,
+                    content,
+                    est,
+                    show_content=show_panel_body,
+                )
                 if getattr(msg, "tool_calls", None):
                     status.update(f"[{ui.THEME['tool']}]● Executing tools...[/]")
                     status.start()
@@ -549,6 +561,7 @@ def run(
 
             try:
                 try:
+                    llm_streamed_had_chunks[0] = False
                     result = run_agent_turn(
                         turn_inp,
                         db_path=db_path,
@@ -635,6 +648,7 @@ def run(
                 effective_model = str(final_state.get("model") or effective_model)
                 model_degraded_loop = bool(final_state.get("model_degraded"))
                 try:
+                    llm_streamed_had_chunks[0] = False
                     result = run_agent_turn(
                         AgentTurnInput(
                             task=task,
