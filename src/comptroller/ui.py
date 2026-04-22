@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
 from rich.console import Console
-from rich.markup import escape
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
@@ -105,33 +104,21 @@ def print_step_tool(step: int, tool_name: str, tool_input: dict, result: str, to
     console.print()
 
 
-def print_llm_stream_chunk(console: Console, chunk: str) -> None:
-    """Stream a token chunk with LLM styling; escapes Rich markup in model text."""
-    console.print(escape(chunk), end="", style=THEME["llm"])
-
-
-def print_step_llm(
-    step: int,
-    content: str,
-    tokens: int,
-    *,
-    show_content: bool = True,
-):
-    """Print LLM response step. Set ``show_content`` False when the body was already streamed above."""
+def print_step_llm(step: int, content: str, tokens: int):
+    """Print LLM response step in a panel (one place; streaming chunks are not echoed to avoid duplicating text)."""
     console.print()
     console.print(
         f"[{THEME['dim']}]#{step}[/] [{THEME['llm']}]◆ llm:reason[/]   "
         f"[{THEME['accent']}]+{tokens} tokens[/]"
     )
 
-    if show_content:
-        console.print(
-            Panel(
-                content,
-                border_style=THEME["llm"],
-                padding=(0, 1),
-            )
+    console.print(
+        Panel(
+            content,
+            border_style=THEME["llm"],
+            padding=(0, 1),
         )
+    )
     console.print()
 
 

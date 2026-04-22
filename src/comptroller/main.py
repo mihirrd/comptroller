@@ -217,7 +217,12 @@ def run(
 
     from . import workspace_checkpoint as wscp
     from .graph import build_graph, summarize_node
-    from .runner import AgentTurnInput, AgentTurnResult, run_agent_turn
+    from .runner import (
+        AgentTurnInput,
+        AgentTurnResult,
+        recent_files_from_checkpointer,
+        run_agent_turn,
+    )
 
     def _workspace_checkpoint_record_reason(r: AgentTurnResult) -> str:
         if r.streaming_token_budget_hit:
@@ -452,6 +457,15 @@ def run(
         # Build graph
         graph = build_graph(db_path)
 
+        # Carried across turns in this process; also seed on resume from checkpoint
+        # so the first follow-up user message after `run --session` sees the same
+        # recent paths as the last completed graph turn.
+        turn_recent_files: list[str] | None = None
+        if session:
+            turn_recent_files = recent_files_from_checkpointer(
+                graph, {"configurable": {"thread_id": session_id}}
+            )
+
         # Continuous conversation loop
         current_tokens = tokens_used_so_far
         current_dollars = dollars_used_so_far
@@ -512,6 +526,7 @@ def run(
                 local_model_id=loc_id,
                 model_degraded=model_degraded_loop,
                 interactive_budget=interactive_loop,
+                recent_files=turn_recent_files,
                 **resume_kw,
             )
 
@@ -519,25 +534,15 @@ def run(
             status = ui.console.status(f"[{ui.THEME['llm']}]● Working on it...[/]", spinner="dots")
             status.start()
 
-            # If the graph streams LLM chunks, we show them with Rich styling; skip duplicating
-            # the same text in a Panel in print_step_llm (notably on resume, chunks replay in bulk).
-            llm_streamed_had_chunks: list[bool] = [False]
-
-            def _on_stream(chunk: str) -> None:
-                llm_streamed_had_chunks[0] = True
-                ui.print_llm_stream_chunk(ui.console, chunk)
+            # Do not print stream chunks to the console: that bypasses the Panel and (on resume) duplicates
+            # the same text. Final output is always shown once in print_step_llm (boxed).
+            def _on_stream(_chunk: str) -> None:
+                pass
 
             def _after_agent_llm(msg: AIMessage, step: int, est: int) -> None:
                 status.stop()
                 content = msg.content if msg.content else "[Tool calls]"
-                show_panel_body = not llm_streamed_had_chunks[0]
-                llm_streamed_had_chunks[0] = False
-                ui.print_step_llm(
-                    step,
-                    content,
-                    est,
-                    show_content=show_panel_body,
-                )
+                ui.print_step_llm(step, content, est)
                 if getattr(msg, "tool_calls", None):
                     status.update(f"[{ui.THEME['tool']}]● Executing tools...[/]")
                     status.start()
@@ -561,7 +566,6 @@ def run(
 
             try:
                 try:
-                    llm_streamed_had_chunks[0] = False
                     result = run_agent_turn(
                         turn_inp,
                         db_path=db_path,
@@ -597,6 +601,11 @@ def run(
             )
             if pending_resume_id and result.final_state is not None:
                 store.clear_session_pending_resume(session_id, db_path)
+
+            if result.final_state is not None:
+                rf = result.final_state.get("recent_files")
+                if isinstance(rf, list):
+                    turn_recent_files = list(rf)
 
             step_counter = result.next_step_counter
             final_state = result.final_state
@@ -648,7 +657,6 @@ def run(
                 effective_model = str(final_state.get("model") or effective_model)
                 model_degraded_loop = bool(final_state.get("model_degraded"))
                 try:
-                    llm_streamed_had_chunks[0] = False
                     result = run_agent_turn(
                         AgentTurnInput(
                             task=task,
@@ -668,6 +676,7 @@ def run(
                             model_degraded=model_degraded_loop,
                             interactive_budget=interactive_loop,
                             append_user_message=False,
+                            recent_files=turn_recent_files,
                         ),
                         db_path=db_path,
                         graph=graph,
@@ -694,6 +703,10 @@ def run(
                     workspace_root=str(Path.cwd()),
                     result=result,
                 )
+                if result.final_state is not None:
+                    rf2 = result.final_state.get("recent_files")
+                    if isinstance(rf2, list):
+                        turn_recent_files = list(rf2)
                 step_counter = result.next_step_counter
                 final_state = result.final_state
                 if not final_state:

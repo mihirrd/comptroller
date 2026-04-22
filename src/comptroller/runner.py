@@ -7,6 +7,7 @@ with optional hooks instead of Rich UI.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TypedDict
@@ -96,6 +97,27 @@ class AgentTurnResult:
     """Head checkpoint id after this turn (from ``SqliteSaver``), if available."""
 
     langgraph_checkpoint_ns: str | None = None
+
+
+def recent_files_from_checkpointer(
+    compiled: Any,
+    config: dict[str, Any],
+) -> list[str] | None:
+    """Read ``recent_files`` from the graph head checkpoint (non-empty list only)."""
+    try:
+        snap = compiled.get_state(config)
+        vals = snap.values
+        if vals is None or not isinstance(vals, Mapping):
+            return None
+        prev = vals.get("recent_files")
+        if isinstance(prev, list) and len(prev) > 0:
+            return list(prev)
+    except Exception:
+        logger.debug(
+            "recent_files: could not read from checkpointer",
+            exc_info=True,
+        )
+    return None
 
 
 def _read_langgraph_checkpoint(compiled: Any, thread_id: str) -> tuple[str | None, str | None]:
@@ -192,19 +214,9 @@ def run_agent_turn(
     # Persisted channel: re-inject recent_files from the head checkpoint so a new
     # turn's partial update does not drop them when omitted from _build_turn_state.
     if inp.recent_files is None:
-        try:
-            snap = compiled.get_state(config)
-            vals = snap.values
-            if isinstance(vals, dict):
-                prev = vals.get("recent_files")
-                if isinstance(prev, list) and len(prev) > 0:
-                    turn_state["recent_files"] = list(prev)
-        except Exception:
-            logger.debug(
-                "recent_files: could not read from checkpointer (session=%s)",
-                inp.session_id,
-                exc_info=True,
-            )
+        prev = recent_files_from_checkpointer(compiled, config)
+        if prev is not None:
+            turn_state["recent_files"] = list(prev)
 
     final_state: dict[str, Any] | None = None
     step_counter = step_counter_start
@@ -377,5 +389,6 @@ __all__ = [
     "AgentTurnInput",
     "AgentTurnResult",
     "SessionTransientRetryBudgetExhausted",
+    "recent_files_from_checkpointer",
     "run_agent_turn",
 ]

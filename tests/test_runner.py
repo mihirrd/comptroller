@@ -1,10 +1,16 @@
 """Tests for the importable :mod:`comptroller.runner` API."""
 
+from collections import UserDict
 from unittest.mock import MagicMock
 
 from langchain_core.messages import HumanMessage
 
-from comptroller.runner import AgentTurnInput, _build_turn_state, run_agent_turn
+from comptroller.runner import (
+    AgentTurnInput,
+    _build_turn_state,
+    recent_files_from_checkpointer,
+    run_agent_turn,
+)
 
 
 def test_build_turn_state_includes_recent_files_when_set():
@@ -72,6 +78,18 @@ def test_run_agent_turn_rehydrates_recent_files_from_checkpointer():
 
     stream_args = mock_graph.stream.call_args[0]
     assert stream_args[0].get("recent_files") == ["/a.py"]
+
+
+def test_recent_files_from_checkpointer_accepts_non_dict_mapping():
+    """``snap.values`` can be a Mapping that is not a ``dict`` (e.g. some LangGraph builds)."""
+    mock_graph = MagicMock()
+    snap = MagicMock()
+    snap.values = UserDict(recent_files=["/m.py"])
+    mock_graph.get_state.return_value = snap
+    out = recent_files_from_checkpointer(
+        mock_graph, {"configurable": {"thread_id": "s1"}}
+    )
+    assert out == ["/m.py"]
 
 
 def test_run_agent_turn_empty_recent_files_in_checkpoint_does_not_inject():
