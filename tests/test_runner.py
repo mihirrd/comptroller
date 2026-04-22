@@ -92,6 +92,25 @@ def test_recent_files_from_checkpointer_accepts_non_dict_mapping():
     assert out == ["/m.py"]
 
 
+def test_run_agent_turn_rehydrates_when_input_empty_list():
+    """Empty ``recent_files`` from the caller is treated as unknown; checkpoint can still supply paths."""
+    mock_graph = MagicMock()
+    mock_graph.stream.return_value = iter([])
+
+    snap_for_files = MagicMock()
+    snap_for_files.config = {"configurable": {"thread_id": "s1"}}
+    snap_for_files.values = UserDict(recent_files=["/from_ckpt.py"])
+    snap_for_lg = MagicMock()
+    snap_for_lg.config = {"configurable": {"checkpoint_id": "ck1", "checkpoint_ns": ""}}
+    mock_graph.get_state.side_effect = [snap_for_files, snap_for_lg]
+
+    inp = AgentTurnInput(task="hello", session_id="s1", max_tokens=1000, recent_files=[])
+    run_agent_turn(inp, db_path=":memory:", graph=mock_graph, log_steps_to_store=False)
+
+    stream_args = mock_graph.stream.call_args[0]
+    assert stream_args[0].get("recent_files") == ["/from_ckpt.py"]
+
+
 def test_run_agent_turn_empty_recent_files_in_checkpoint_does_not_inject():
     """Explicit empty checkpoint list does not set turn_state (no second source of truth)."""
     mock_graph = MagicMock()

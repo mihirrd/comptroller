@@ -20,7 +20,7 @@ class AgentState(TypedDict):
     max_session_retries: int | None  # None = unlimited (per-call COMPTROLLER_LLM_RETRY_ATTEMPTS still applies)
     status: str  # "running" | "summarizing" | "complete" | "awaiting_budget"
     summary: str | None
-    recent_files: NotRequired[list[str]]  # paths touched by tools; shown via per-turn context message, not system prompt
+    recent_files: NotRequired[list[str]]  # read/write/edit paths only; not listings; contents stay in ToolMessages
     # OpenAI-compatible local server (LiteLLM openai/* + api_base); used when cloud token/dollar budget is exceeded.
     local_model_url: NotRequired[str | None]
     local_model_id: NotRequired[str | None]  # model name on that server (e.g. llama3.2)

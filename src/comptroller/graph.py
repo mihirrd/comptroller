@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import sqlite3
@@ -40,7 +41,7 @@ def _max_message_window() -> int:
 
 
 def _recent_files_context_block(paths: list[str] | None) -> str:
-    """Human-readable block injected each agent turn (not part of build_system_prompt)."""
+    """Paths-only reminder of files read or edited; tool bodies stay in the transcript, not here."""
     header = "### Recently touched files (session)\n\n"
     if not paths:
         return header + "(none recorded yet)"
@@ -301,17 +302,50 @@ def _merge_recent_files(existing: list[str] | None, new_paths: list[str]) -> lis
     return combined[-MAX_RECENT_FILES:]
 
 
+def _coerce_tool_call_args(tc: dict[str, Any]) -> dict[str, Any]:
+    """Normalize tool args to a ``dict`` (OpenAI / LiteLLM sometimes use a JSON string or ``function.arguments``)."""
+    raw: Any = tc.get("args")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            return {}
+    fn = tc.get("function")
+    if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+        try:
+            parsed = json.loads(fn["arguments"])
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError, KeyError):
+            pass
+    args_alt = tc.get("arguments")
+    if isinstance(args_alt, str) and args_alt.strip():
+        try:
+            parsed = json.loads(args_alt)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
 def _find_tool_call(msgs: list[Any], tool_call_id: str) -> tuple[str | None, dict[str, Any]]:
     for msg in reversed(msgs):
         if not isinstance(msg, AIMessage):
             continue
         tcs = getattr(msg, "tool_calls", None) or []
         for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
             if tc.get("id") == tool_call_id:
-                args = tc.get("args") or {}
-                if not isinstance(args, dict):
-                    args = {}
-                return tc.get("name"), args
+                tname = tc.get("name")
+                if not tname and isinstance(tc.get("function"), dict):
+                    tname = tc["function"].get("name")
+                return tname, _coerce_tool_call_args(tc)
     return None, {}
 
 
@@ -334,11 +368,29 @@ def _paths_from_patch_text(patch_text: str) -> list[str]:
     return out
 
 
+def _resolved_touch_path(wr: Path, raw: str | None) -> str | None:
+    if not raw:
+        return None
+    try:
+        return str(Path(str(raw)).expanduser().resolve())
+    except Exception:
+        return str(raw)
+
+
 def _paths_from_tool_messages(
     state: AgentState,
     msgs: list[Any],
     tool_messages: list[ToolMessage],
 ) -> list[str]:
+    """File paths to hint what the session is *working in* (read / write / edit / patch).
+
+    We intentionally **exclude** tools like ``list_directory`` or broad ``grep``/``glob`` targets: a
+    listed directory is not a *relevant file* hint, and those paths add noise. Tool output (including
+    full ``read_file`` bodies) already lives in the message history; this list stays **paths only** to
+    avoid duplicating content and token bloat. For the same reason we do not embed file contents here.
+    Merged in ``tool_node_wrapper``; ``agent_node`` injects a short per-turn ``HumanMessage`` (see
+    ``RECENT_FILES_CONTEXT_MSG_ID``).
+    """
     paths: list[str] = []
     wr = Path(state["workspace_root"]).expanduser().resolve()
     for tm in tool_messages:
@@ -346,6 +398,8 @@ def _paths_from_tool_messages(
         if not tid:
             continue
         name, args = _find_tool_call(msgs, tid)
+        if not name:
+            continue
         if name == "apply_patch":
             for p in _paths_from_patch_text(args.get("patch_text") or ""):
                 try:
@@ -356,16 +410,36 @@ def _paths_from_tool_messages(
                 except Exception:
                     paths.append(p)
             continue
-        if name not in ("read_file", "write_file", "search_replace"):
+        if name in ("read_file", "write_file", "search_replace"):
+            p = _resolved_touch_path(wr, args.get("path"))
+            if p:
+                paths.append(p)
             continue
-        raw = args.get("path")
-        if not raw:
-            continue
-        try:
-            paths.append(str(Path(raw).expanduser().resolve()))
-        except Exception:
-            paths.append(str(raw))
     return paths
+
+
+def _effective_recent_files_for_context(state: AgentState) -> list[str] | None:
+    """Paths shown in the \"Recently touched files\" HumanMessage.
+
+    Uses ``state[\"recent_files\"]`` when non-empty. If that channel is empty or missing (e.g. not
+    serialized in a checkpoint) but the transcript already contains read/write/edit tool results,
+    derive paths with the **same rules** as ``_paths_from_tool_messages`` so this stays aligned with
+    the tool digest built from ``state[\"messages\"]``.
+    """
+    direct = state.get("recent_files")
+    if isinstance(direct, list) and len(direct) > 0:
+        return list(direct)
+    msgs = state.get("messages") or []
+    tm_only = [m for m in msgs if isinstance(m, ToolMessage)]
+    if not tm_only:
+        return None
+    raw = _paths_from_tool_messages(state, msgs, tm_only)
+    if not raw:
+        return None
+    merged: list[str] | None = None
+    for p in raw:
+        merged = _merge_recent_files(merged, [p])
+    return merged if merged else None
 
 
 def _compact_tool_digest(msgs: list[Any]) -> str:
@@ -429,8 +503,10 @@ def agent_node(state: AgentState) -> AgentState:
         system_msg = SystemMessage(content=build_system_prompt(prompt_state))
         messages.insert(0, system_msg)
 
+    # Prefer ``state[\"recent_files\"]``; fall back to transcript-derived paths when the channel
+    # lags the tool history (common when digest shows tools but the list was not restored).
     recent_ctx = HumanMessage(
-        content=_recent_files_context_block(state.get("recent_files")),
+        content=_recent_files_context_block(_effective_recent_files_for_context(state)),
         id=RECENT_FILES_CONTEXT_MSG_ID,
     )
     if messages and isinstance(messages[0], SystemMessage):

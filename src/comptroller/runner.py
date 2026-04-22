@@ -213,7 +213,10 @@ def run_agent_turn(
 
     # Persisted channel: re-inject recent_files from the head checkpoint so a new
     # turn's partial update does not drop them when omitted from _build_turn_state.
-    if inp.recent_files is None:
+    # Also treat an explicit ``[]`` from the caller as "unknown" so we can replace with checkpoint data.
+    if inp.recent_files is None or (
+        isinstance(inp.recent_files, list) and len(inp.recent_files) == 0
+    ):
         prev = recent_files_from_checkpointer(compiled, config)
         if prev is not None:
             turn_state["recent_files"] = list(prev)

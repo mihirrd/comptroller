@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -9,6 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, Syst
 from comptroller.graph import (
     MAX_TOOL_MSG_CHARS,
     RECENT_FILES_CONTEXT_MSG_ID,
+    _find_tool_call,
     _prepare_messages_for_llm,
     _state_messages_with_sliding_window,
     _trim_messages_window,
@@ -572,6 +574,31 @@ def test_tool_node_tracks_recent_files():
         Path(raw_path).unlink(missing_ok=True)
 
 
+def test_find_tool_call_parses_openai_style_function_arguments():
+    """Providers may send OpenAI-style ``function`` + JSON ``arguments``; paths must still resolve."""
+    m = AIMessage.model_construct(
+        content="",
+        tool_calls=[
+            {
+                "id": "c-json",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": json.dumps(
+                        {
+                            "path": "/tmp/x.py",
+                            "content": "print(1)",
+                        }
+                    ),
+                },
+            }
+        ],
+    )
+    name, args = _find_tool_call([m], "c-json")
+    assert name == "write_file"
+    assert args.get("path") == "/tmp/x.py"
+
+
 def test_prepare_messages_truncates_long_tool_output():
     """Very long ToolMessage content is trimmed only in the copy passed to the LLM."""
     long_body = "x" * (MAX_TOOL_MSG_CHARS + 500)
@@ -655,3 +682,53 @@ def test_agent_node_inserts_recent_files_context_for_llm():
     ctx = next(m for m in sent if getattr(m, "id", None) == RECENT_FILES_CONTEXT_MSG_ID)
     assert "/tmp/ws/foo.py" in ctx.content
     assert "Recently touched files" in ctx.content
+
+
+def test_agent_node_recent_files_derived_from_transcript_when_channel_empty():
+    """When ``recent_files`` is missing from state but messages include read/write tools, show paths."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "do something",
+        "model": "gpt-4o",
+        "workspace_root": "/tmp/ws",
+        "messages": [
+            HumanMessage(content="do something"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {"path": "/tmp/ws/maze.py", "content": "x"},
+                        "id": "t1",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="ok",
+                tool_call_id="t1",
+                name="write_file",
+            ),
+        ],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "running",
+        "summary": None,
+    }
+    mock_response = AIMessage(content="done")
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+        agent_node(state)
+
+    sent = mock_llm.bind_tools.return_value.invoke.call_args[0][0]
+    ctx = next(m for m in sent if getattr(m, "id", None) == RECENT_FILES_CONTEXT_MSG_ID)
+    assert "maze.py" in ctx.content
+    assert "(none recorded yet)" not in ctx.content
