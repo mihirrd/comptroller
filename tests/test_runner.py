@@ -41,6 +41,9 @@ def test_build_turn_state_omits_messages_when_append_disabled():
 def test_run_agent_turn_no_updates_returns_none_state():
     mock_graph = MagicMock()
     mock_graph.stream.return_value = iter([])
+    mock_snap = MagicMock()
+    mock_snap.config = {"configurable": {}}
+    mock_graph.get_state.return_value = mock_snap
 
     inp = AgentTurnInput(task="hello", session_id="s1", max_tokens=1000)
     out = run_agent_turn(inp, db_path=":memory:", graph=mock_graph, log_steps_to_store=False)
@@ -48,3 +51,4 @@ def test_run_agent_turn_no_updates_returns_none_state():
     assert out.final_state is None
     assert out.streaming_token_budget_hit is False
     mock_graph.stream.assert_called_once()
+    mock_graph.get_state.assert_called_once()

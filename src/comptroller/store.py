@@ -32,6 +32,38 @@ def _migrate_sessions_schema(conn: sqlite3.Connection) -> None:
         cursor.execute("ALTER TABLE sessions ADD COLUMN local_model_url TEXT")
     if "local_model_id" not in cols:
         cursor.execute("ALTER TABLE sessions ADD COLUMN local_model_id TEXT")
+    if "pending_resume_checkpoint_id" not in cols:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN pending_resume_checkpoint_id TEXT")
+    if "pending_resume_checkpoint_ns" not in cols:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN pending_resume_checkpoint_ns TEXT")
+    conn.commit()
+
+
+def _migrate_workspace_checkpoints_table(conn: sqlite3.Connection) -> None:
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='workspace_checkpoints'"
+    )
+    if cursor.fetchone():
+        return
+    cursor.execute(
+        """
+        CREATE TABLE workspace_checkpoints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            git_commit_sha TEXT NOT NULL,
+            git_parent_sha TEXT,
+            langgraph_checkpoint_id TEXT,
+            langgraph_checkpoint_ns TEXT,
+            step_counter INTEGER,
+            workspace_root TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(session_id, seq)
+        )
+        """
+    )
     conn.commit()
 
 
@@ -45,6 +77,7 @@ def _ensure_sessions_schema(conn: sqlite3.Connection, db_path_resolved: str) -> 
     if db_path_resolved in _schema_checked:
         return
     _migrate_sessions_schema(conn)
+    _migrate_workspace_checkpoints_table(conn)
     _schema_checked.add(db_path_resolved)
 
 
@@ -262,3 +295,138 @@ def list_sessions(db_path: str = "~/.agent-runtime-mvp/sessions.db") -> list[dic
     conn.close()
 
     return [dict(row) for row in rows]
+
+
+def next_workspace_checkpoint_seq(session_id: str, db_path: str) -> int:
+    """Next ``seq`` for ``session_id`` (1-based)."""
+    db_path = str(Path(db_path).expanduser())
+    conn = _connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM workspace_checkpoints WHERE session_id = ?",
+        (session_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return int(row[0]) if row else 1
+
+
+def insert_workspace_checkpoint(
+    session_id: str,
+    seq: int,
+    reason: str,
+    git_commit_sha: str,
+    git_parent_sha: str | None,
+    langgraph_checkpoint_id: str | None,
+    langgraph_checkpoint_ns: str | None,
+    step_counter: int | None,
+    workspace_root: str,
+    db_path: str,
+) -> None:
+    db_path = str(Path(db_path).expanduser())
+    conn = _connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO workspace_checkpoints (
+            session_id, seq, reason, git_commit_sha, git_parent_sha,
+            langgraph_checkpoint_id, langgraph_checkpoint_ns,
+            step_counter, workspace_root, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            seq,
+            reason,
+            git_commit_sha,
+            git_parent_sha,
+            langgraph_checkpoint_id,
+            langgraph_checkpoint_ns,
+            step_counter,
+            workspace_root,
+            time.time(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_workspace_checkpoints(session_id: str, db_path: str) -> list[dict]:
+    db_path = str(Path(db_path).expanduser())
+    conn = _connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM workspace_checkpoints WHERE session_id = ? ORDER BY seq",
+        (session_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_workspace_checkpoint(session_id: str, seq: int, db_path: str) -> dict:
+    db_path = str(Path(db_path).expanduser())
+    conn = _connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM workspace_checkpoints WHERE session_id = ? AND seq = ?",
+        (session_id, seq),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def set_session_pending_resume(
+    session_id: str,
+    checkpoint_id: str | None,
+    checkpoint_ns: str | None,
+    db_path: str,
+) -> None:
+    db_path = str(Path(db_path).expanduser())
+    conn = _connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE sessions
+        SET pending_resume_checkpoint_id = ?,
+            pending_resume_checkpoint_ns = ?,
+            updated_at = ?
+        WHERE session_id = ?
+        """,
+        (checkpoint_id, checkpoint_ns, time.time(), session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_session_pending_resume(session_id: str, db_path: str) -> tuple[str | None, str | None]:
+    row = get_session(session_id, db_path)
+    if not row:
+        return None, None
+    cid = row.get("pending_resume_checkpoint_id")
+    cns = row.get("pending_resume_checkpoint_ns")
+    if not cid:
+        return None, None
+    return str(cid), (str(cns) if cns is not None else "")
+
+
+def clear_session_pending_resume(session_id: str, db_path: str) -> None:
+    db_path = str(Path(db_path).expanduser())
+    conn = _connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE sessions
+        SET pending_resume_checkpoint_id = NULL,
+            pending_resume_checkpoint_ns = NULL,
+            updated_at = ?
+        WHERE session_id = ?
+        """,
+        (time.time(), session_id),
+    )
+    conn.commit()
+    conn.close()

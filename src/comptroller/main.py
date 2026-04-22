@@ -1,5 +1,6 @@
 import logging
 import os
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -214,8 +215,89 @@ def run(
     """Run an agent task with token, optional dollar, and optional wall-time budgets. Supports continuous conversation mode."""
     from langchain_core.messages import AIMessage, ToolMessage
 
+    from . import workspace_checkpoint as wscp
     from .graph import build_graph, summarize_node
-    from .runner import AgentTurnInput, run_agent_turn
+    from .runner import AgentTurnInput, AgentTurnResult, run_agent_turn
+
+    def _workspace_checkpoint_record_reason(r: AgentTurnResult) -> str:
+        if r.streaming_token_budget_hit:
+            return "streaming_budget"
+        if not r.final_state:
+            return "no_final_state"
+        return "halt"
+
+    def _record_workspace_halt_db(
+        *,
+        session_id: str,
+        db_path: str,
+        workspace_root: str,
+        result: AgentTurnResult,
+    ) -> None:
+        root = Path(workspace_root).expanduser().resolve()
+        if not wscp.is_git_workspace(root):
+            return
+        seq = store.next_workspace_checkpoint_seq(session_id, db_path)
+        commit_sha, parent_sha, err = wscp.create_git_checkpoint(
+            root,
+            session_id,
+            seq,
+            message=f"comptroller {_workspace_checkpoint_record_reason(result)}",
+        )
+        if err:
+            logger.warning("workspace git checkpoint skipped: %s", err)
+            return
+        store.insert_workspace_checkpoint(
+            session_id,
+            seq,
+            _workspace_checkpoint_record_reason(result),
+            commit_sha,
+            parent_sha,
+            result.langgraph_checkpoint_id,
+            result.langgraph_checkpoint_ns,
+            result.next_step_counter,
+            str(root),
+            db_path,
+        )
+
+    def _record_workspace_error_checkpoint(
+        *,
+        session_id: str,
+        db_path: str,
+        workspace_root: str,
+        graph,
+    ) -> None:
+        root = Path(workspace_root).expanduser().resolve()
+        if not wscp.is_git_workspace(root):
+            return
+        lg_id: str | None = None
+        lg_ns: str | None = None
+        try:
+            snap = graph.get_state({"configurable": {"thread_id": session_id}})
+            cfg = snap.config.get("configurable") or {}
+            lg_id = cfg.get("checkpoint_id")
+            lg_ns = cfg.get("checkpoint_ns")
+        except Exception:
+            logger.exception("workspace error checkpoint: get_state failed")
+        seq = store.next_workspace_checkpoint_seq(session_id, db_path)
+        commit_sha, parent_sha, err = wscp.create_git_checkpoint(
+            root, session_id, seq, message="comptroller error"
+        )
+        if err:
+            logger.warning("workspace git checkpoint skipped after error: %s", err)
+            return
+        store.insert_workspace_checkpoint(
+            session_id,
+            seq,
+            "error",
+            commit_sha,
+            parent_sha,
+            lg_id,
+            lg_ns,
+            None,
+            str(root),
+            db_path,
+        )
+
     load_dotenv()
     ui.print_banner()
 
@@ -407,6 +489,12 @@ def run(
 
             prev_degraded_outer = model_degraded_loop
 
+            pending_resume_id, pending_resume_ns = store.get_session_pending_resume(session_id, db_path)
+            resume_kw: dict = {}
+            if pending_resume_id:
+                resume_kw["resume_langgraph_checkpoint_id"] = pending_resume_id
+                resume_kw["resume_langgraph_checkpoint_ns"] = pending_resume_ns
+
             turn_inp = AgentTurnInput(
                 task=task,
                 session_id=session_id,
@@ -424,6 +512,7 @@ def run(
                 local_model_id=loc_id,
                 model_degraded=model_degraded_loop,
                 interactive_budget=interactive_loop,
+                **resume_kw,
             )
 
             ui.console.print()
@@ -459,24 +548,42 @@ def run(
                 ui.print_summarizing()
 
             try:
-                result = run_agent_turn(
-                    turn_inp,
-                    db_path=db_path,
-                    graph=graph,
-                    callbacks={
-                        "on_streaming_llm_text": _on_stream,
-                        "after_agent_llm": _after_agent_llm,
-                        "after_tool": _after_tool,
-                        "on_summarize_shown": _on_summarize_shown,
-                    },
-                    log_steps_to_store=True,
-                    step_counter_start=step_counter,
-                )
+                try:
+                    result = run_agent_turn(
+                        turn_inp,
+                        db_path=db_path,
+                        graph=graph,
+                        callbacks={
+                            "on_streaming_llm_text": _on_stream,
+                            "after_agent_llm": _after_agent_llm,
+                            "after_tool": _after_tool,
+                            "on_summarize_shown": _on_summarize_shown,
+                        },
+                        log_steps_to_store=True,
+                        step_counter_start=step_counter,
+                    )
+                except Exception:
+                    _record_workspace_error_checkpoint(
+                        session_id=session_id,
+                        db_path=db_path,
+                        workspace_root=str(Path.cwd()),
+                        graph=graph,
+                    )
+                    raise
             finally:
                 try:
                     status.stop()
                 except Exception:
                     pass
+
+            _record_workspace_halt_db(
+                session_id=session_id,
+                db_path=db_path,
+                workspace_root=str(Path.cwd()),
+                result=result,
+            )
+            if pending_resume_id and result.final_state is not None:
+                store.clear_session_pending_resume(session_id, db_path)
 
             step_counter = result.next_step_counter
             final_state = result.final_state
@@ -527,36 +634,51 @@ def run(
                 )
                 effective_model = str(final_state.get("model") or effective_model)
                 model_degraded_loop = bool(final_state.get("model_degraded"))
-                result = run_agent_turn(
-                    AgentTurnInput(
-                        task=task,
+                try:
+                    result = run_agent_turn(
+                        AgentTurnInput(
+                            task=task,
+                            session_id=session_id,
+                            model=effective_model,
+                            workspace_root=str(Path.cwd()),
+                            tokens_used=int(final_state["tokens_used"]),
+                            max_tokens=max_tokens,
+                            api_dollars_used=float(final_state.get("api_dollars_used") or 0),
+                            max_api_dollars=max_api_dollars,
+                            wall_seconds_used=float(final_state.get("wall_seconds_used") or 0),
+                            max_wall_seconds=max_wall_s,
+                            session_retries_used=int(final_state.get("session_retries_used") or 0),
+                            max_session_retries=session_retry_cap,
+                            local_model_url=loc_url,
+                            local_model_id=loc_id,
+                            model_degraded=model_degraded_loop,
+                            interactive_budget=interactive_loop,
+                            append_user_message=False,
+                        ),
+                        db_path=db_path,
+                        graph=graph,
+                        callbacks={
+                            "on_streaming_llm_text": _on_stream,
+                            "after_agent_llm": _after_agent_llm,
+                            "after_tool": _after_tool,
+                            "on_summarize_shown": _on_summarize_shown,
+                        },
+                        log_steps_to_store=True,
+                        step_counter_start=step_counter,
+                    )
+                except Exception:
+                    _record_workspace_error_checkpoint(
                         session_id=session_id,
-                        model=effective_model,
+                        db_path=db_path,
                         workspace_root=str(Path.cwd()),
-                        tokens_used=int(final_state["tokens_used"]),
-                        max_tokens=max_tokens,
-                        api_dollars_used=float(final_state.get("api_dollars_used") or 0),
-                        max_api_dollars=max_api_dollars,
-                        wall_seconds_used=float(final_state.get("wall_seconds_used") or 0),
-                        max_wall_seconds=max_wall_s,
-                        session_retries_used=int(final_state.get("session_retries_used") or 0),
-                        max_session_retries=session_retry_cap,
-                        local_model_url=loc_url,
-                        local_model_id=loc_id,
-                        model_degraded=model_degraded_loop,
-                        interactive_budget=interactive_loop,
-                        append_user_message=False,
-                    ),
+                        graph=graph,
+                    )
+                    raise
+                _record_workspace_halt_db(
+                    session_id=session_id,
                     db_path=db_path,
-                    graph=graph,
-                    callbacks={
-                        "on_streaming_llm_text": _on_stream,
-                        "after_agent_llm": _after_agent_llm,
-                        "after_tool": _after_tool,
-                        "on_summarize_shown": _on_summarize_shown,
-                    },
-                    log_steps_to_store=True,
-                    step_counter_start=step_counter,
+                    workspace_root=str(Path.cwd()),
+                    result=result,
                 )
                 step_counter = result.next_step_counter
                 final_state = result.final_state
@@ -672,7 +794,10 @@ def run(
                 f"[bold]LLM backoff retries used:[/bold] {current_session_retries} / {session_retry_cap}"
             )
         ui.console.print(f"[{ui.THEME['dim']}]Session ID: {session_id}[/]")
-        ui.console.print(f"[{ui.THEME['dim']}]Resume: python main.py run --session {session_id}[/]")
+        ui.console.print(f"[{ui.THEME['dim']}]Resume: comptroller run --session {session_id}[/]")
+        ui.console.print(
+            f"[{ui.THEME['dim']}]Checkpoints: comptroller checkpoints list --session {session_id}[/]"
+        )
         ui.console.print("─" * 80)
         ui.console.print()
 
@@ -726,6 +851,112 @@ def inspect(session: Annotated[str, typer.Option("--session")]):
     steps_data = store.get_steps(session, db_path)
 
     ui.print_inspect(session_data, steps_data)
+
+
+checkpoints_app = typer.Typer(help="Git workspace snapshots at agent halts; diff and rollback.")
+
+
+@checkpoints_app.command("list")
+def checkpoints_list(session: Annotated[str, typer.Option("--session")]):
+    """List recorded workspace checkpoints for a session."""
+    db_path = str(Path(DB_PATH).expanduser())
+    if not Path(db_path).exists():
+        ui.print_error("Database not found. Run 'init' first.")
+        raise typer.Exit(1)
+    try:
+        rows = store.list_workspace_checkpoints(session, db_path)
+    except sqlite3.OperationalError as exc:
+        ui.print_error(f"Cannot open database: {exc}")
+        raise typer.Exit(1)
+    ui.console.print(f"[bold]Session[/bold] {session}")
+    ui.print_workspace_checkpoints_table(rows)
+
+
+@checkpoints_app.command("show")
+def checkpoints_show(
+    session: Annotated[str, typer.Option("--session")],
+    seq: Annotated[int, typer.Option("--seq")],
+):
+    """Show the unified diff for a checkpoint (parent → commit)."""
+    from . import workspace_checkpoint as wscp
+
+    db_path = str(Path(DB_PATH).expanduser())
+    if not Path(db_path).exists():
+        ui.print_error("Database not found. Run 'init' first.")
+        raise typer.Exit(1)
+    try:
+        row = store.get_workspace_checkpoint(session, seq, db_path)
+    except sqlite3.OperationalError as exc:
+        ui.print_error(f"Cannot open database: {exc}")
+        raise typer.Exit(1)
+    if not row:
+        ui.print_error(f"No checkpoint {seq} for session {session!r}")
+        raise typer.Exit(1)
+    root = Path(row["workspace_root"]).expanduser().resolve()
+    diff = wscp.diff_commits(root, row.get("git_parent_sha"), row["git_commit_sha"])
+    ui.print_workspace_checkpoint_diff(diff, title=f"Checkpoint {seq} ({row.get('reason', '')})")
+
+
+@checkpoints_app.command("rollback")
+def checkpoints_rollback(
+    session: Annotated[str, typer.Option("--session")],
+    seq: Annotated[int, typer.Option("--seq")],
+    yes: Annotated[bool, typer.Option("--yes", help="Skip confirmation prompt")] = False,
+):
+    """Restore the workspace git tree to a checkpoint and queue LangGraph resume on next run."""
+    from . import workspace_checkpoint as wscp
+
+    db_path = str(Path(DB_PATH).expanduser())
+    if not Path(db_path).exists():
+        ui.print_error("Database not found. Run 'init' first.")
+        raise typer.Exit(1)
+    try:
+        session_row = store.get_session(session, db_path)
+        row = store.get_workspace_checkpoint(session, seq, db_path)
+    except sqlite3.OperationalError as exc:
+        ui.print_error(f"Cannot open database: {exc}")
+        raise typer.Exit(1)
+    if not session_row:
+        ui.print_error(f"Session {session!r} not found")
+        raise typer.Exit(1)
+    if not row:
+        ui.print_error(f"No checkpoint {seq} for session {session!r}")
+        raise typer.Exit(1)
+    root = Path(row["workspace_root"]).expanduser().resolve()
+    if not root.is_dir():
+        ui.print_error(f"Workspace root is not a directory: {root}")
+        raise typer.Exit(1)
+    if not wscp.is_git_workspace(root):
+        ui.print_error(f"Not a git workspace: {root}")
+        raise typer.Exit(1)
+    short = row["git_commit_sha"][:7]
+    msg = (
+        f"Restore files under\n  {root}\n"
+        f"to git tree {short}… and (if stored) resume LangGraph from that halt?\n"
+        "Session token/API budgets stay cumulative (unchanged)."
+    )
+    if not yes and not typer.confirm(msg, default=False):
+        raise typer.Exit(0)
+    err = wscp.restore_worktree(root, row["git_commit_sha"], mode="restore")
+    if err:
+        ui.print_error(err)
+        raise typer.Exit(1)
+    cid = row.get("langgraph_checkpoint_id")
+    cns = row.get("langgraph_checkpoint_ns")
+    if cid:
+        store.set_session_pending_resume(session, str(cid), str(cns) if cns is not None else "", db_path)
+        ui.console.print(
+            f"[{ui.THEME['success']}]Git tree restored. Next "
+            f"[bold]comptroller run --session {session}[/bold] resumes LangGraph from the stored checkpoint.[/]"
+        )
+    else:
+        ui.console.print(
+            f"[{ui.THEME['warning']}]Git tree restored; no LangGraph checkpoint id on this row — "
+            "next run keeps the latest transcript (files-only rollback).[/]"
+        )
+
+
+app.add_typer(checkpoints_app, name="checkpoints")
 
 
 if __name__ == "__main__":

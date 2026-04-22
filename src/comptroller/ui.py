@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.progress import BarColumn, Progress, TextColumn
 from datetime import datetime
@@ -477,6 +478,57 @@ def print_error(message: str):
         title="[bold]Error[/bold]",
         border_style=THEME["error"]
     ))
+    console.print()
+
+
+def print_workspace_checkpoints_table(rows: list[dict]) -> None:
+    """Print workspace checkpoint metadata for a session."""
+    if not rows:
+        console.print(f"[{THEME['dim']}]No workspace checkpoints recorded (git repo + halts only).[/]")
+        console.print()
+        return
+    table = Table(title="Workspace checkpoints")
+    table.add_column("seq", justify="right", style="dim")
+    table.add_column("reason", style="cyan")
+    table.add_column("git commit", style="white", max_width=14)
+    table.add_column("LangGraph id", style="white", max_width=20)
+    table.add_column("step", justify="right")
+    table.add_column("workspace", style="dim", max_width=36)
+    for r in rows:
+        gid = r.get("langgraph_checkpoint_id") or ""
+        if len(gid) > 18:
+            gid = gid[:15] + "..."
+        gc = r.get("git_commit_sha") or ""
+        if len(gc) > 12:
+            gc = gc[:9] + "..."
+        ws = str(r.get("workspace_root") or "")
+        if len(ws) > 34:
+            ws = ws[:31] + "..."
+        table.add_row(
+            str(r.get("seq", "")),
+            str(r.get("reason", "")),
+            gc,
+            gid or "—",
+            str(r.get("step_counter") if r.get("step_counter") is not None else "—"),
+            ws,
+        )
+    console.print(table)
+    console.print()
+
+
+def print_workspace_checkpoint_diff(diff_text: str, *, title: str = "Diff") -> None:
+    """Print a unified diff with syntax highlighting."""
+    body = diff_text if diff_text.strip() else "(empty diff)"
+    if body == "(empty diff)":
+        console.print(Panel(body, title=title, border_style=THEME["dim"]))
+    else:
+        console.print(
+            Panel(
+                Syntax(body, "diff", theme="ansi_dark", word_wrap=True),
+                title=title,
+                border_style=THEME["accent"],
+            )
+        )
     console.print()
 
 

@@ -67,6 +67,12 @@ class AgentTurnInput:
     interactive_budget: bool = False
     append_user_message: bool = True  # False: checkpoint-only continuation (e.g. after awaiting_budget)
 
+    resume_langgraph_checkpoint_id: str | None = None
+    """When set, the graph starts from this LangGraph checkpoint (time travel / rollback)."""
+
+    resume_langgraph_checkpoint_ns: str | None = None
+    """Namespace for ``resume_langgraph_checkpoint_id`` (empty string for the root graph)."""
+
 
 @dataclass
 class AgentTurnResult:
@@ -85,6 +91,21 @@ class AgentTurnResult:
     current_dollars: float
     current_wall_seconds: float
     current_session_retries: int
+
+    langgraph_checkpoint_id: str | None = None
+    """Head checkpoint id after this turn (from ``SqliteSaver``), if available."""
+
+    langgraph_checkpoint_ns: str | None = None
+
+
+def _read_langgraph_checkpoint(compiled: Any, thread_id: str) -> tuple[str | None, str | None]:
+    try:
+        snap = compiled.get_state({"configurable": {"thread_id": thread_id}})
+        cfg = snap.config.get("configurable") or {}
+        return cfg.get("checkpoint_id"), cfg.get("checkpoint_ns")
+    except Exception:
+        logger.exception("read_langgraph_checkpoint failed for thread_id=%s", thread_id)
+        return None, None
 
 
 def _build_turn_state(inp: AgentTurnInput) -> dict[str, Any]:
@@ -161,7 +182,12 @@ def run_agent_turn(
     tools_mod.set_workspace_root_for_tools(turn_state["workspace_root"])
 
     compiled = graph if graph is not None else build_graph(db_path)
-    config = {"configurable": {"thread_id": inp.session_id}}
+    cfg: dict[str, Any] = {"thread_id": inp.session_id}
+    if inp.resume_langgraph_checkpoint_id:
+        cfg["checkpoint_id"] = inp.resume_langgraph_checkpoint_id
+    if inp.resume_langgraph_checkpoint_ns is not None:
+        cfg["checkpoint_ns"] = inp.resume_langgraph_checkpoint_ns
+    config: dict[str, Any] = {"configurable": cfg}
 
     final_state: dict[str, Any] | None = None
     step_counter = step_counter_start
@@ -280,6 +306,7 @@ def run_agent_turn(
         }
         summary_result = summarize_node(partial_state)
         final_state = summary_result
+        lg_id, lg_ns = _read_langgraph_checkpoint(compiled, inp.session_id)
         return AgentTurnResult(
             final_state=final_state,
             streaming_token_budget_hit=True,
@@ -292,10 +319,13 @@ def run_agent_turn(
             current_session_retries=int(
                 summary_result.get("session_retries_used", inp.session_retries_used)
             ),
+            langgraph_checkpoint_id=lg_id,
+            langgraph_checkpoint_ns=lg_ns,
         )
 
     if not final_state:
         logger.warning("run_agent_turn: graph stream produced no update state")
+        lg_id, lg_ns = _read_langgraph_checkpoint(compiled, inp.session_id)
         return AgentTurnResult(
             final_state=None,
             streaming_token_budget_hit=False,
@@ -304,8 +334,11 @@ def run_agent_turn(
             current_dollars=inp.api_dollars_used,
             current_wall_seconds=inp.wall_seconds_used,
             current_session_retries=inp.session_retries_used,
+            langgraph_checkpoint_id=lg_id,
+            langgraph_checkpoint_ns=lg_ns,
         )
 
+    lg_id, lg_ns = _read_langgraph_checkpoint(compiled, inp.session_id)
     return AgentTurnResult(
         final_state=final_state,
         streaming_token_budget_hit=False,
@@ -316,6 +349,8 @@ def run_agent_turn(
         current_session_retries=int(
             final_state.get("session_retries_used", inp.session_retries_used)
         ),
+        langgraph_checkpoint_id=lg_id,
+        langgraph_checkpoint_ns=lg_ns,
     )
 
 
