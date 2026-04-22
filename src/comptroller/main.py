@@ -148,6 +148,17 @@ def _resolve_local_model_id(cli: str | None, session_val: str | None = None) -> 
     return None
 
 
+def _interactive_budget_enabled(cli_flag: bool) -> bool:
+    if cli_flag:
+        return True
+    return os.environ.get("COMPTROLLER_INTERACTIVE_BUDGET", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 @app.command()
 def run(
     task: Annotated[str, typer.Argument()] = None,
@@ -190,14 +201,25 @@ def run(
             help="Model name on the local server (required with --local-model-url). Also COMPTROLLER_LOCAL_MODEL.",
         ),
     ] = None,
+    interactive_budget: Annotated[
+        bool,
+        typer.Option(
+            "--interactive-budget",
+            help="When a budget is exceeded, prompt to add more headroom instead of summarizing immediately. "
+            "Also COMPTROLLER_INTERACTIVE_BUDGET=1.",
+            is_flag=True,
+        ),
+    ] = False,
 ):
     """Run an agent task with token, optional dollar, and optional wall-time budgets. Supports continuous conversation mode."""
     from langchain_core.messages import AIMessage, ToolMessage
 
-    from .graph import build_graph
+    from .graph import build_graph, summarize_node
     from .runner import AgentTurnInput, run_agent_turn
     load_dotenv()
     ui.print_banner()
+
+    interactive_loop = _interactive_budget_enabled(interactive_budget)
 
     max_api_dollars = max_dollars if max_dollars is not None else _max_api_dollars_from_env()
     max_wall_s = (
@@ -257,18 +279,18 @@ def run(
             )
             raise typer.Exit(1)
 
-        if tokens_used_so_far >= max_tokens and not model_degraded_loop:
+        if tokens_used_so_far >= max_tokens and not model_degraded_loop and not interactive_loop:
             ui.print_error(f"Session {session_id} has exceeded token budget of {max_tokens:,}")
             ui.console.print("[dim]Please reset the session")
             raise typer.Exit(1)
-        if max_api_dollars is not None and dollars_used_so_far >= max_api_dollars and not model_degraded_loop:
+        if max_api_dollars is not None and dollars_used_so_far >= max_api_dollars and not model_degraded_loop and not interactive_loop:
             ui.print_error(
                 f"Session {session_id} has exceeded API dollar budget "
                 f"(${dollars_used_so_far:.4f} / ${max_api_dollars:.4f})"
             )
             ui.console.print("[dim]Please reset the session")
             raise typer.Exit(1)
-        if max_wall_s is not None and wall_seconds_so_far >= max_wall_s:
+        if max_wall_s is not None and wall_seconds_so_far >= max_wall_s and not interactive_loop:
             ui.print_error(
                 f"Session {session_id} has reached wall-time budget "
                 f"({wall_seconds_so_far:.1f}s / {max_wall_s:.0f}s agent time)"
@@ -383,7 +405,7 @@ def run(
                     ui.console.print("[dim]Exiting session...[/dim]")
                     break
 
-            prev_degraded = model_degraded_loop
+            prev_degraded_outer = model_degraded_loop
 
             turn_inp = AgentTurnInput(
                 task=task,
@@ -401,6 +423,7 @@ def run(
                 local_model_url=loc_url,
                 local_model_id=loc_id,
                 model_degraded=model_degraded_loop,
+                interactive_budget=interactive_loop,
             )
 
             ui.console.print()
@@ -478,10 +501,78 @@ def run(
                 ui.print_error("Graph execution failed - no final state returned")
                 break
 
-            current_tokens = result.current_tokens
-            current_dollars = result.current_dollars
-            current_wall_seconds = result.current_wall_seconds
-            current_session_retries = result.current_session_retries
+            while final_state.get("status") == "awaiting_budget":
+                choice = ui.prompt_budget_extension(
+                    tokens_used=int(final_state["tokens_used"]),
+                    max_tokens=int(final_state["max_tokens"]),
+                    dollars_used=float(final_state.get("api_dollars_used") or 0),
+                    max_dollars=final_state.get("max_api_dollars"),
+                    wall_used=float(final_state.get("wall_seconds_used") or 0),
+                    max_wall_seconds=final_state.get("max_wall_seconds"),
+                )
+                if choice.stop_and_summarize:
+                    final_state = summarize_node({**final_state, "status": "summarizing"})
+                    break
+                max_tokens += choice.extra_tokens
+                if max_api_dollars is not None:
+                    max_api_dollars += choice.extra_dollars
+                if max_wall_s is not None:
+                    max_wall_s += choice.extra_wall_seconds
+                store.update_session_budget_caps(
+                    session_id,
+                    db_path,
+                    max_tokens=max_tokens,
+                    max_api_dollars=max_api_dollars,
+                    max_wall_seconds=max_wall_s,
+                )
+                effective_model = str(final_state.get("model") or effective_model)
+                model_degraded_loop = bool(final_state.get("model_degraded"))
+                result = run_agent_turn(
+                    AgentTurnInput(
+                        task=task,
+                        session_id=session_id,
+                        model=effective_model,
+                        workspace_root=str(Path.cwd()),
+                        tokens_used=int(final_state["tokens_used"]),
+                        max_tokens=max_tokens,
+                        api_dollars_used=float(final_state.get("api_dollars_used") or 0),
+                        max_api_dollars=max_api_dollars,
+                        wall_seconds_used=float(final_state.get("wall_seconds_used") or 0),
+                        max_wall_seconds=max_wall_s,
+                        session_retries_used=int(final_state.get("session_retries_used") or 0),
+                        max_session_retries=session_retry_cap,
+                        local_model_url=loc_url,
+                        local_model_id=loc_id,
+                        model_degraded=model_degraded_loop,
+                        interactive_budget=interactive_loop,
+                        append_user_message=False,
+                    ),
+                    db_path=db_path,
+                    graph=graph,
+                    callbacks={
+                        "on_streaming_llm_text": _on_stream,
+                        "after_agent_llm": _after_agent_llm,
+                        "after_tool": _after_tool,
+                        "on_summarize_shown": _on_summarize_shown,
+                    },
+                    log_steps_to_store=True,
+                    step_counter_start=step_counter,
+                )
+                step_counter = result.next_step_counter
+                final_state = result.final_state
+                if not final_state:
+                    break
+
+            if not final_state:
+                ui.print_error("Graph execution failed - no final state returned")
+                break
+
+            current_tokens = int(final_state["tokens_used"])
+            current_dollars = float(final_state.get("api_dollars_used", current_dollars))
+            current_wall_seconds = float(final_state.get("wall_seconds_used", current_wall_seconds))
+            current_session_retries = int(
+                final_state.get("session_retries_used", current_session_retries)
+            )
 
             effective_model = str(final_state.get("model") or effective_model)
             model_degraded_loop = bool(final_state.get("model_degraded"))
@@ -512,7 +603,7 @@ def run(
                 local_model_id=loc_id,
             )
 
-            if model_degraded_loop and not prev_degraded:
+            if model_degraded_loop and not prev_degraded_outer:
                 ui.print_local_model_fallback(loc_url or "", effective_model)
 
             # Check if budget exceeded or summarizing (local fallback keeps the session open)

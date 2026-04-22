@@ -196,6 +196,30 @@ def update_session(
     conn.close()
 
 
+def update_session_budget_caps(
+    session_id: str,
+    db_path: str,
+    *,
+    max_tokens: int,
+    max_api_dollars: float | None,
+    max_wall_seconds: float | None,
+):
+    """Persist raised session budget caps (token, optional dollar, optional wall)."""
+    db_path = str(Path(db_path).expanduser())
+    conn = _connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE sessions
+        SET max_tokens = ?, max_api_dollars = ?, max_wall_seconds = ?, updated_at = ?
+        WHERE session_id = ?
+        """,
+        (max_tokens, max_api_dollars, max_wall_seconds, time.time(), session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_session(session_id: str, db_path: str = "~/.agent-runtime-mvp/sessions.db") -> dict:
     """Get session by ID."""
     db_path = str(Path(db_path).expanduser())

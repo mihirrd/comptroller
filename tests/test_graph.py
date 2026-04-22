@@ -140,6 +140,50 @@ def test_after_tools_gate_routes_to_continue_not_end():
     assert budget_gate(state) == "end"
 
 
+def test_budget_gate_awaiting_budget_routes_to_end():
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "t",
+        "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
+        "messages": [HumanMessage(content="hi"), AIMessage(content="done")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "awaiting_budget",
+        "summary": None,
+    }
+    assert budget_gate(state) == "end"
+
+
+def test_after_tools_gate_awaiting_budget_routes_to_end():
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "t",
+        "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
+        "messages": [HumanMessage(content="x")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "awaiting_budget",
+        "summary": None,
+    }
+    assert after_tools_gate(state) == "end"
+
+
 def test_after_tools_gate_respects_summarizing():
     """When budget hit during tools, route to summarize instead of agent."""
     state: AgentState = {
@@ -161,6 +205,46 @@ def test_after_tools_gate_respects_summarizing():
         "summary": None,
     }
     assert after_tools_gate(state) == "summarize"
+
+
+def test_wall_budget_interactive_sets_awaiting_budget():
+    """With interactive_budget, wall cap uses awaiting_budget instead of summarizing."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "test task",
+        "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": 1.0,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "running",
+        "summary": None,
+        "interactive_budget": True,
+    }
+    mock_response = AIMessage(
+        content="Short",
+        usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+        response_metadata={"model_name": "gpt-4o"},
+    )
+    with (
+        patch("comptroller.graph.ChatLiteLLM") as mock_llm_class,
+        patch("comptroller.graph.time.monotonic", side_effect=[0.0, 5.0]),
+    ):
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        result = agent_node(state)
+
+    assert result["status"] == "awaiting_budget"
+    assert budget_gate(result) == "end"
 
 
 def test_wall_budget_exceeded_triggers_summarize():
@@ -247,6 +331,75 @@ def test_dollar_budget_exceeded_triggers_summarize():
     assert result["api_dollars_used"] >= state["max_api_dollars"]
     assert budget_gate(result) == "summarize"
     assert dollars_from_llm_message(mock_response, "gpt-4o") > 0
+
+
+def test_token_budget_interactive_sets_awaiting_budget():
+    """With interactive_budget, token cap uses awaiting_budget instead of summarizing."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "test task",
+        "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 1,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "running",
+        "summary": None,
+        "interactive_budget": True,
+    }
+    mock_response = AIMessage(content="x")
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        result = agent_node(state)
+
+    assert result["status"] == "awaiting_budget"
+    assert budget_gate(result) == "end"
+
+
+def test_token_budget_interactive_prefers_hold_over_local_degradation():
+    """interactive_budget takes precedence over automatic local model fallback."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "test task",
+        "model": "gpt-4o",
+        "workspace_root": "/tmp/test-ws",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 1,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "running",
+        "summary": None,
+        "local_model_url": "http://127.0.0.1:11434/v1",
+        "local_model_id": "llama3.2",
+        "model_degraded": False,
+        "interactive_budget": True,
+    }
+    mock_response = AIMessage(content="x")
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        result = agent_node(state)
+
+    assert result["status"] == "awaiting_budget"
+    assert result.get("model_degraded") is not True
 
 
 def test_token_budget_exceeded_with_local_fallback_degrades_model():

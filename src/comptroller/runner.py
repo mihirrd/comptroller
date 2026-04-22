@@ -48,7 +48,9 @@ class AgentTurnInput:
     """Defaults to process current working directory."""
 
     messages: list[BaseMessage] | None = None
-    """If ``None``, uses ``[HumanMessage(content=task)]``."""
+    """If set, used as the turn's messages update. If ``None`` and ``append_user_message`` is True, uses
+    ``[HumanMessage(content=task)]``. If ``None`` and ``append_user_message`` is False, ``messages`` is omitted
+    so the checkpointer transcript is unchanged."""
 
     tokens_used: int = 0
     max_tokens: int = 1000
@@ -62,6 +64,8 @@ class AgentTurnInput:
     local_model_url: str | None = None
     local_model_id: str | None = None
     model_degraded: bool = False
+    interactive_budget: bool = False
+    append_user_message: bool = True  # False: checkpoint-only continuation (e.g. after awaiting_budget)
 
 
 @dataclass
@@ -85,13 +89,11 @@ class AgentTurnResult:
 
 def _build_turn_state(inp: AgentTurnInput) -> dict[str, Any]:
     root = inp.workspace_root if inp.workspace_root is not None else str(Path.cwd())
-    msgs = inp.messages if inp.messages is not None else [HumanMessage(content=inp.task)]
     state: dict[str, Any] = {
         "session_id": inp.session_id,
         "task": inp.task,
         "model": inp.model,
         "workspace_root": root,
-        "messages": msgs,
         "tool_results": [],
         "tokens_used": inp.tokens_used,
         "max_tokens": inp.max_tokens,
@@ -106,7 +108,12 @@ def _build_turn_state(inp: AgentTurnInput) -> dict[str, Any]:
         "local_model_url": inp.local_model_url,
         "local_model_id": inp.local_model_id,
         "model_degraded": inp.model_degraded,
+        "interactive_budget": inp.interactive_budget,
     }
+    if inp.messages is not None:
+        state["messages"] = inp.messages
+    elif inp.append_user_message:
+        state["messages"] = [HumanMessage(content=inp.task)]
     if inp.recent_files is not None:
         state["recent_files"] = list(inp.recent_files)
     return state
@@ -269,6 +276,7 @@ def run_agent_turn(
             "local_model_url": inp.local_model_url,
             "local_model_id": inp.local_model_id,
             "model_degraded": inp.model_degraded,
+            "interactive_budget": inp.interactive_budget,
         }
         summary_result = summarize_node(partial_state)
         final_state = summary_result

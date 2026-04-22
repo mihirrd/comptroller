@@ -18,10 +18,11 @@ class AgentState(TypedDict):
     max_wall_seconds: float | None  # None = no wall-time cap
     session_retries_used: int  # LLM transient-error backoff retries consumed this session
     max_session_retries: int | None  # None = unlimited (per-call COMPTROLLER_LLM_RETRY_ATTEMPTS still applies)
-    status: str  # "running" | "summarizing" | "complete"
+    status: str  # "running" | "summarizing" | "complete" | "awaiting_budget"
     summary: str | None
     recent_files: NotRequired[list[str]]  # paths touched by tools; shown via per-turn context message, not system prompt
     # OpenAI-compatible local server (LiteLLM openai/* + api_base); used when cloud token/dollar budget is exceeded.
     local_model_url: NotRequired[str | None]
     local_model_id: NotRequired[str | None]  # model name on that server (e.g. llama3.2)
     model_degraded: NotRequired[bool]  # True after switching from primary to local endpoint
+    interactive_budget: NotRequired[bool]  # CLI: pause at budget for user to raise caps instead of summarizing

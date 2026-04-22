@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -179,6 +181,125 @@ def print_token_bar(
             f"[{wcolor}]{wpct:.0f}%[/{wcolor}]"
         )
     console.print()
+
+
+@dataclass
+class BudgetExtensionChoice:
+    """User response when a session hits ``awaiting_budget``."""
+
+    extra_tokens: int = 0
+    extra_dollars: float = 0.0
+    extra_wall_seconds: float = 0.0
+    stop_and_summarize: bool = False
+
+
+def prompt_budget_extension(
+    *,
+    tokens_used: int,
+    max_tokens: int,
+    dollars_used: float,
+    max_dollars: float | None,
+    wall_used: float,
+    max_wall_seconds: float | None,
+) -> BudgetExtensionChoice:
+    """Ask whether to raise caps for exceeded dimensions, or summarize and end."""
+    token_hit = tokens_used >= max_tokens
+    dollar_hit = max_dollars is not None and dollars_used >= max_dollars
+    wall_hit = max_wall_seconds is not None and wall_used >= max_wall_seconds
+
+    lines = [
+        "[bold]A session budget limit was reached.[/bold]",
+        "",
+        f"Tokens: [bold]{tokens_used:,}[/] / [bold]{max_tokens:,}[/]",
+    ]
+    if max_dollars is not None:
+        lines.append(f"Est. API spend: [bold]${dollars_used:.4f}[/] / [bold]${max_dollars:.4f}[/]")
+    if max_wall_seconds is not None:
+        lines.append(
+            f"Agent wall time: [bold]{format_wall_seconds(wall_used)}[/] / "
+            f"[bold]{format_wall_seconds(max_wall_seconds)}[/]"
+        )
+    lines.extend(
+        [
+            "",
+            "[dim]You can add more headroom to the cap(s) that were exceeded, or end with a summary.[/dim]",
+        ]
+    )
+    console.print()
+    console.print(Panel("\n".join(lines), title="Budget", border_style=THEME["warning"]))
+    console.print()
+
+    while True:
+        ans = console.input(
+            f"[{THEME['accent']}]Extend limits? [y]es / [n]o (no = summarize and stop): [/]"
+        ).strip().lower()
+        if ans in ("n", "no", "q", "quit", ""):
+            return BudgetExtensionChoice(stop_and_summarize=True)
+        if ans in ("y", "yes"):
+            break
+        console.print(f"[{THEME['dim']}]Please enter y or n.[/]")
+
+    extra_tokens = 0
+    extra_dollars = 0.0
+    extra_wall = 0.0
+
+    if token_hit:
+        while True:
+            raw = console.input(
+                f"[{THEME['accent']}]Add how many tokens to the session cap? (integer ≥ 0): [/]"
+            ).strip()
+            try:
+                extra_tokens = int(raw)
+            except ValueError:
+                console.print(f"[{THEME['dim']}]Enter a whole number (e.g. 5000).[/]")
+                continue
+            if extra_tokens < 0:
+                console.print(f"[{THEME['dim']}]Must be ≥ 0.[/]")
+                continue
+            break
+
+    if dollar_hit:
+        while True:
+            raw = console.input(
+                f"[{THEME['accent']}]Add how many USD to the API spend cap? (e.g. 0.50): [/]"
+            ).strip()
+            try:
+                extra_dollars = float(raw)
+            except ValueError:
+                console.print(f"[{THEME['dim']}]Enter a decimal number.[/]")
+                continue
+            if extra_dollars < 0:
+                console.print(f"[{THEME['dim']}]Must be ≥ 0.[/]")
+                continue
+            break
+
+    if wall_hit:
+        while True:
+            raw = console.input(
+                f"[{THEME['accent']}]Add how many seconds to the agent wall-time cap? (number ≥ 0): [/]"
+            ).strip()
+            try:
+                extra_wall = float(raw)
+            except ValueError:
+                console.print(f"[{THEME['dim']}]Enter a number.[/]")
+                continue
+            if extra_wall < 0:
+                console.print(f"[{THEME['dim']}]Must be ≥ 0.[/]")
+                continue
+            break
+
+    if extra_tokens == 0 and extra_dollars == 0.0 and extra_wall == 0.0:
+        console.print(
+            f"[{THEME['warning']}]No increase entered; summarizing and stopping instead.[/]"
+        )
+        return BudgetExtensionChoice(stop_and_summarize=True)
+
+    return BudgetExtensionChoice(
+        extra_tokens=extra_tokens,
+        extra_dollars=extra_dollars,
+        extra_wall_seconds=extra_wall,
+        stop_and_summarize=False,
+    )
 
 
 def print_local_model_fallback(api_base: str, litellm_model: str) -> None:

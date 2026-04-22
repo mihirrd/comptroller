@@ -267,11 +267,12 @@ def _apply_model_degradation(new_state: AgentState, prev_state: AgentState) -> N
 
 
 def _apply_budget_exceeded_status(new_state: AgentState, prev_state: AgentState) -> None:
-    """Set ``summarizing`` when a hard budget is hit, or switch to local LLM if configured (token/dollar only)."""
+    """Set ``summarizing`` or ``awaiting_budget``, or switch to local LLM when token/dollar cap hits."""
+    interactive = bool(prev_state.get("interactive_budget"))
     degraded = bool(prev_state.get("model_degraded"))
     wcap = prev_state.get("max_wall_seconds")
     if wcap is not None and new_state["wall_seconds_used"] >= wcap:
-        new_state["status"] = "summarizing"
+        new_state["status"] = "awaiting_budget" if interactive else "summarizing"
         return
 
     token_exceeded = new_state["tokens_used"] >= prev_state["max_tokens"]
@@ -282,7 +283,9 @@ def _apply_budget_exceeded_status(new_state: AgentState, prev_state: AgentState)
         return
 
     if token_exceeded or dollar_exceeded:
-        if _degradation_configured(prev_state):
+        if interactive:
+            new_state["status"] = "awaiting_budget"
+        elif _degradation_configured(prev_state):
             _apply_model_degradation(new_state, prev_state)
         else:
             new_state["status"] = "summarizing"
@@ -539,11 +542,14 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
     new_state["tokens_used"] = state["tokens_used"] + total_tokens
     new_state["wall_seconds_used"] = state["wall_seconds_used"] + _wall_dt
 
+    interactive = bool(state.get("interactive_budget"))
     wcap = state.get("max_wall_seconds")
     if wcap is not None and new_state["wall_seconds_used"] >= wcap:
-        new_state["status"] = "summarizing"
+        new_state["status"] = "awaiting_budget" if interactive else "summarizing"
     elif not state.get("model_degraded") and new_state["tokens_used"] >= state["max_tokens"]:
-        if _degradation_configured(state):
+        if interactive:
+            new_state["status"] = "awaiting_budget"
+        elif _degradation_configured(state):
             _apply_model_degradation(new_state, state)
         else:
             new_state["status"] = "summarizing"
@@ -559,6 +565,8 @@ def budget_gate(state: AgentState) -> str:
     """Route from agent node: tools, summarize, or end."""
     if state["status"] == "summarizing":
         return "summarize"
+    if state["status"] == "awaiting_budget":
+        return "end"
 
     if not state["messages"]:
         return "end"
@@ -578,6 +586,8 @@ def after_tools_gate(state: AgentState) -> str:
     """
     if state["status"] == "summarizing":
         return "summarize"
+    if state["status"] == "awaiting_budget":
+        return "end"
     return "continue"
 
 
@@ -686,6 +696,7 @@ def build_graph(db_path: str = "~/.agent-runtime-mvp/sessions.db"):
         {
             "continue": "agent",
             "summarize": "summarize",
+            "end": END,
         },
     )
 
@@ -709,6 +720,7 @@ def run_graph(
     local_model_url: str | None = None,
     local_model_id: str | None = None,
     model_degraded: bool = False,
+    interactive_budget: bool = False,
 ):
     """Run the graph and return final state."""
     graph = build_graph(db_path)
@@ -735,6 +747,7 @@ def run_graph(
         "local_model_url": local_model_url,
         "local_model_id": local_model_id,
         "model_degraded": model_degraded,
+        "interactive_budget": interactive_budget,
     }
 
     # Run graph

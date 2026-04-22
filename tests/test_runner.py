@@ -26,6 +26,18 @@ def test_build_turn_state_omits_recent_files_when_none():
     assert "recent_files" not in st
 
 
+def test_build_turn_state_omits_messages_when_append_disabled():
+    inp = AgentTurnInput(
+        task="t",
+        session_id="abc",
+        max_tokens=500,
+        append_user_message=False,
+    )
+    st = _build_turn_state(inp)
+    assert "messages" not in st
+    assert st.get("interactive_budget") is False
+
+
 def test_run_agent_turn_no_updates_returns_none_state():
     mock_graph = MagicMock()
     mock_graph.stream.return_value = iter([])
