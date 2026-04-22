@@ -14,7 +14,7 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 
 from comptroller_swebench.git_workspace import clone_instance_workspace
-from comptroller_swebench.run_instance import run_single_instance
+from comptroller_swebench.run_instance import resolve_max_wall_seconds, run_single_instance
 
 
 def _find_instance(ds, instance_id: str) -> dict:
@@ -35,6 +35,7 @@ def run_clone_infer_cleanup(
     model_name_or_path: str,
     scratch_parent: Optional[Path],
     db_parent: Optional[Path],
+    max_wall_seconds: float | None,
 ) -> dict:
     """Load row, clone to a temp dir, infer, append one JSONL line, remove temp dir."""
     ds = load_dataset(dataset_name, split=split)
@@ -60,6 +61,7 @@ def run_clone_infer_cleanup(
             max_tokens=max_tokens,
             model_name_or_path=model_name_or_path,
             db_parent=db_parent,
+            max_wall_seconds=max_wall_seconds,
         )
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
@@ -110,6 +112,14 @@ def clone_run(
         ),
     ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+    max_wall_seconds: Annotated[
+        Optional[float],
+        typer.Option(
+            "--max-wall-seconds",
+            help="Max cumulative agent wall time (s) for LLM/tools/summary; "
+            "omit to use COMPTROLLER_MAX_WALL_SECONDS or max_wall_seconds env.",
+        ),
+    ] = None,
 ) -> None:
     """Clone GitHub repo at ``base_commit``, run inference, delete clone; keep JSONL line."""
     load_dotenv()
@@ -117,11 +127,18 @@ def clone_run(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
+    resolved_wall = resolve_max_wall_seconds(max_wall_seconds)
     empty = {
         "instance_id": instance_id,
         "model_name_or_path": model_name_or_path,
         "model_patch": "",
+        "tokens_used": 0,
+        "max_tokens": max_tokens,
+        "api_dollars_used": 0.0,
+        "wall_seconds_used": 0.0,
     }
+    if resolved_wall is not None:
+        empty["max_wall_seconds"] = round(resolved_wall, 3)
     try:
         pred = run_clone_infer_cleanup(
             instance_id,
@@ -133,6 +150,7 @@ def clone_run(
             model_name_or_path=model_name_or_path,
             scratch_parent=scratch_parent,
             db_parent=db_parent,
+            max_wall_seconds=max_wall_seconds,
         )
     except KeyError:
         typer.echo(f"Error: instance_id not in dataset: {instance_id!r}", err=True)

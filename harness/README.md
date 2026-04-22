@@ -97,11 +97,17 @@ Each line is typically:
 {
   "instance_id": "owner__repo-issue",
   "model_name_or_path": "comptroller",
-  "model_patch": "unified diff string"
+  "model_patch": "unified diff string",
+  "tokens_used": 112138,
+  "max_tokens": 500000,
+  "api_dollars_used": 0.057086,
+  "wall_seconds_used": 103.669
 }
 ```
 
-Confirm field names against your installed `swebench` ([evaluation guide](https://www.swebench.com/SWE-bench/guides/evaluation/)).
+The last four fields are **Comptroller harness metrics** (estimated tokens used, budget, optional dollar estimate, wall time). **`run_evaluation` ignores extra keys**; only `instance_id` and `model_patch` matter for scoring.
+
+Confirm required field names against your installed `swebench` ([evaluation guide](https://www.swebench.com/SWE-bench/guides/evaluation/)).
 
 ## 6. Inference CLIs
 
@@ -138,6 +144,8 @@ comptroller-swebench --workspace-root /path/to/repo --limit 1 --output predictio
 
 **Docker materialize** (optional): `--materialize-docker` and related flags — see **§7**.
 
+**`--max-wall-seconds`** (and the same env vars as `comptroller run`) apply here as well.
+
 Module: `python -m comptroller_swebench ...` (same flags as the console script).
 
 ### `comptroller-swebench-clone-run` (clone → infer → delete clone)
@@ -151,6 +159,7 @@ comptroller-swebench-clone-run astropy__astropy-12907 \
   --max-tokens 500000
 ```
 
+- **`--max-wall-seconds`**: optional cap on cumulative agent wall time (LLM + tools + summary), same semantics as `comptroller run`. If omitted, `COMPTROLLER_MAX_WALL_SECONDS` or `max_wall_seconds` in the environment is used when set. Successful JSONL lines may include **`max_wall_seconds`** when a cap applies.
 - **`--scratch-parent`**: parent directory for the temp clone (default: system temp).
 - On failure after the instance was found, an **empty `model_patch`** line may still be appended (same spirit as the main CLI).
 

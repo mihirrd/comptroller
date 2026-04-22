@@ -64,6 +64,35 @@ def test_workspace_jail_blocks_escape():
         assert "escapes workspace_root" in out
 
 
+def test_read_file_respects_line_range():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "f.txt"
+        p.write_text("a\nb\nc\nd\ne\n")
+        out = read_file.invoke({"path": str(p), "start_line": 2, "end_line": 4})
+        assert "[lines 2-4 of 5 total]" in out
+        _, body = out.split("\n", 1)
+        assert body == "b\nc\nd"
+        assert not body.startswith("a")
+
+
+def test_read_file_full_when_no_range():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "f.txt"
+        p.write_text("only\n")
+        out = read_file.invoke({"path": str(p)})
+        assert "[1 lines]" in out
+        assert "only" in out
+
+
+def test_read_file_start_past_eof_empty():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "f.txt"
+        p.write_text("x\n")
+        out = read_file.invoke({"path": str(p), "start_line": 10, "end_line": 12})
+        assert "file has 1 lines" in out
+        assert "no lines in range" in out
+
+
 def test_relative_path_resolves_under_workspace_not_cwd():
     """Regression: relative tool paths must not use process cwd when jail is set."""
     with tempfile.TemporaryDirectory() as d:

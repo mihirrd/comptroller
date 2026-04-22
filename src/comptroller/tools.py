@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 from langchain_core.tools import tool
 
@@ -75,9 +76,60 @@ def _resolve_path(path: str) -> tuple[Path | None, str | None]:
     return p, None
 
 
+def _read_file_slice(
+    content: str,
+    *,
+    start_line: Optional[int],
+    end_line: Optional[int],
+) -> tuple[str, int, int, int]:
+    """Return (body, total_lines, first_line_no, last_line_no) for a 1-based inclusive range.
+
+    If both ``start_line`` and ``end_line`` are None, the full file is returned and
+    ``first_line_no``/``last_line_no`` are 1 and total_lines (or 0,0 for empty).
+    """
+    lines = content.splitlines()
+    total = len(lines)
+    if start_line is None and end_line is None:
+        body = content
+        if total == 0:
+            return body, 0, 0, 0
+        return body, total, 1, total
+
+    if start_line is not None and start_line < 1:
+        raise ValueError("start_line must be >= 1 when provided")
+    if end_line is not None and end_line < 1:
+        raise ValueError("end_line must be >= 1 when provided")
+
+    start = 1 if start_line is None else start_line
+    end = total if end_line is None else end_line
+    if start > end:
+        start, end = end, start
+    if total == 0:
+        return "", 0, start, end
+    # Explicit start past EOF → empty slice (do not clamp to last line).
+    if start_line is not None and start > total:
+        return "", total, start, end
+    start_eff = max(1, start)
+    end_eff = min(end, total)
+    if start_eff > end_eff:
+        return "", total, start_eff, end_eff
+    chunk = lines[start_eff - 1 : end_eff]
+    body = "\n".join(chunk)
+    return body, total, start_eff, end_eff
+
+
 @tool
-def read_file(path: str) -> str:
-    """Read file contents and return with line count header."""
+def read_file(
+    path: str,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
+) -> str:
+    """Read file contents with an optional 1-based inclusive line range.
+
+    Omit ``start_line`` and ``end_line`` to return the full file. Pass either or both
+    to return only those lines (end is clamped to file length). Line numbers match
+    typical editor / ``grep -n`` output (first line is 1).
+    """
     file_path, err = _resolve_path(path)
     if err:
         return err
@@ -88,8 +140,24 @@ def read_file(path: str) -> str:
             return f"Error: Not a file: {path}"
 
         content = file_path.read_text()
-        line_count = len(content.splitlines())
-        return f"[{line_count} lines]\n{content}"
+        try:
+            body, total, lo, hi = _read_file_slice(
+                content, start_line=start_line, end_line=end_line
+            )
+        except ValueError as e:
+            return f"Error: {e}"
+
+        if start_line is None and end_line is None:
+            return f"[{total} lines]\n{body}"
+
+        if total == 0:
+            return f"[lines {lo}-{hi} of 0 total]\n"
+        if not body and lo > total:
+            return (
+                f"[lines {lo}-{hi} requested; file has {total} lines]\n"
+                "(no lines in range)"
+            )
+        return f"[lines {lo}-{hi} of {total} total]\n{body}"
     except Exception as e:
         return f"Error reading file {path}: {str(e)}"
 

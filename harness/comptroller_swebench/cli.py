@@ -11,7 +11,7 @@ import typer
 from datasets import load_dataset
 from dotenv import load_dotenv
 
-from comptroller_swebench.run_instance import run_single_instance
+from comptroller_swebench.run_instance import resolve_max_wall_seconds, run_single_instance
 from comptroller_swebench.workspace_docker import materialize_testbed_to_host
 
 
@@ -97,6 +97,14 @@ def _run(
             help="Optional run_id for SWE-bench materialize logs (default: random per process).",
         ),
     ] = None,
+    max_wall_seconds: Annotated[
+        Optional[float],
+        typer.Option(
+            "--max-wall-seconds",
+            help="Max cumulative agent wall time (s) for LLM/tools/summary; "
+            "omit to use COMPTROLLER_MAX_WALL_SECONDS or max_wall_seconds env.",
+        ),
+    ] = None,
 ) -> None:
     """Run Comptroller on Lite instances and append prediction lines to ``--output``."""
     load_dotenv()
@@ -161,6 +169,7 @@ def _run(
         f" (per-instance under {root})" if materialize_docker and len(rows) > 1 else ""
     )
     typer.echo(f"Running {len(rows)} instance(s); workspace base={root}{hint}")
+    resolved_wall = resolve_max_wall_seconds(max_wall_seconds)
     with output.open("a", encoding="utf-8") as f:
         for row in rows:
             iid = row["instance_id"]
@@ -191,6 +200,7 @@ def _run(
                     max_tokens=max_tokens,
                     model_name_or_path=model_name_or_path,
                     db_parent=db_parent,
+                    max_wall_seconds=max_wall_seconds,
                 )
             except Exception as e:
                 typer.echo(f"Error on {iid}: {e}", err=True)
@@ -198,7 +208,13 @@ def _run(
                     "instance_id": iid,
                     "model_name_or_path": model_name_or_path,
                     "model_patch": "",
+                    "tokens_used": 0,
+                    "max_tokens": max_tokens,
+                    "api_dollars_used": 0.0,
+                    "wall_seconds_used": 0.0,
                 }
+                if resolved_wall is not None:
+                    pred["max_wall_seconds"] = round(resolved_wall, 3)
                 logging.exception("instance %s failed", iid)
             f.write(json.dumps(pred, ensure_ascii=False) + "\n")
             f.flush()
