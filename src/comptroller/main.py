@@ -960,7 +960,7 @@ def checkpoints_rollback(
     msg = (
         f"Restore files under\n  {root}\n"
         f"to git tree {short}… and (if stored) resume LangGraph from that halt?\n"
-        "Session token/API budgets stay cumulative (unchanged)."
+        "Confirm restore"
     )
     if not yes and not typer.confirm(msg, default=False):
         raise typer.Exit(0)
