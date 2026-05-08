@@ -254,6 +254,7 @@ def run_agent_turn(
     token_count = 0
     ai_message = ""
     streaming_hit = False
+    token_budget_exceeded = False
 
     db_resolved = str(Path(db_path).expanduser())
 
@@ -348,6 +349,34 @@ def run_agent_turn(
                     fn = cb.get("on_summarize_shown")
                     if fn:
                         fn()
+
+                if node_state.get("tokens_used", 0) >= inp.max_tokens:
+                    token_budget_exceeded = True
+
+            if token_budget_exceeded:
+                break
+
+    if token_budget_exceeded and final_state is not None:
+        if not final_state.get("summary"):
+            msgs = final_state.get("messages") or []
+            for msg in reversed(msgs):
+                if isinstance(msg, AIMessage) and msg.content:
+                    final_state = {**final_state, "summary": msg.content}
+                    break
+        lg_id, lg_ns = _read_langgraph_checkpoint(compiled, inp.session_id)
+        return AgentTurnResult(
+            final_state=final_state,
+            streaming_token_budget_hit=True,
+            next_step_counter=step_counter,
+            current_tokens=int(final_state["tokens_used"]),
+            current_dollars=float(final_state.get("api_dollars_used", inp.api_dollars_used)),
+            current_wall_seconds=float(final_state.get("wall_seconds_used", inp.wall_seconds_used)),
+            current_session_retries=int(
+                final_state.get("session_retries_used", inp.session_retries_used)
+            ),
+            langgraph_checkpoint_id=lg_id,
+            langgraph_checkpoint_ns=lg_ns,
+        )
 
     if streaming_hit:
         partial_state = {

@@ -209,6 +209,64 @@ def _invoke_with_transient_retries(
     raise RuntimeError("_invoke_with_transient_retries: unreachable")
 
 
+def _stream_with_transient_retries(
+    fn: Callable[[], Any],
+    *,
+    context: str,
+    retry_budget_state: AgentState | None = None,
+) -> Any:
+    """Yield chunks from fn(). Retries from scratch on transient errors before the first chunk.
+
+    If a transient error occurs after chunks have already been yielded (mid-stream), it is
+    re-raised immediately — partial output cannot be safely replayed.
+    """
+    attempts = _llm_retry_attempts()
+    for attempt in range(attempts):
+        yielded_any = False
+        try:
+            for chunk in fn():
+                yielded_any = True
+                yield chunk
+            return
+        except _LLM_TRANSIENT_EXCEPTIONS as e:
+            if yielded_any or attempt >= attempts - 1:
+                logger.error("%s: failed after %s attempts: %s", context, attempts, e)
+                raise
+            if retry_budget_state is not None:
+                cap = retry_budget_state.get("max_session_retries")
+                if cap is not None:
+                    used = int(retry_budget_state.get("session_retries_used", 0))
+                    if used >= cap:
+                        logger.error(
+                            "%s: session transient retry budget exhausted (%s/%s) after %s: %s",
+                            context,
+                            used,
+                            cap,
+                            type(e).__name__,
+                            e,
+                        )
+                        raise SessionTransientRetryBudgetExhausted(used, cap, e) from e
+                    retry_budget_state["session_retries_used"] = used + 1
+                    logger.info(
+                        "%s: session transient backoff retry %s/%s after %s",
+                        context,
+                        retry_budget_state["session_retries_used"],
+                        cap,
+                        type(e).__name__,
+                    )
+            delay = _llm_backoff_seconds(attempt)
+            logger.warning(
+                "%s: %s (attempt %s/%s); sleeping %.1fs then retrying",
+                context,
+                type(e).__name__,
+                attempt + 1,
+                attempts,
+                delay,
+            )
+            time.sleep(delay)
+    raise RuntimeError("_stream_with_transient_retries: unreachable")
+
+
 def _litellm_openai_compatible_model(local_model_id: str) -> str:
     """LiteLLM id for an OpenAI-compatible ``api_base`` (Ollama, LM Studio, vLLM, etc.)."""
     # lid = local_model_id.strip()
@@ -547,13 +605,27 @@ def agent_node(state: AgentState) -> AgentState:
     )
     logger.info("LLM request messages:\n%s", _format_messages_for_log(messages_for_llm))
 
-    # Call LLM (truncated tool bodies only in this copy)
+    # Stream LLM response; break early when text content tokens reach the remaining budget.
+    # Tool-call chunks are not counted toward the early-exit check (they finish quickly and
+    # must be complete for the tool node to parse them).
     _t_wall = time.monotonic()
-    response = _invoke_with_transient_retries(
-        lambda: llm_with_tools.invoke(messages_for_llm),
+    _accumulated: Any = None
+    _content_chars = 0
+    _remaining_tokens = state["max_tokens"] - state["tokens_used"]
+    _has_tool_calls = False
+    for _chunk in _stream_with_transient_retries(
+        lambda: llm_with_tools.stream(messages_for_llm),
         context=f"LLM agent session_id={state['session_id']}",
         retry_budget_state=state,
-    )
+    ):
+        _accumulated = _chunk if _accumulated is None else _accumulated + _chunk
+        if getattr(_chunk, "tool_call_chunks", None):
+            _has_tool_calls = True
+        if _chunk.content and not _has_tool_calls:
+            _content_chars += len(_chunk.content)
+            if _content_chars // 4 >= _remaining_tokens:
+                break
+    response = _accumulated if _accumulated is not None else AIMessage(content="")
     _wall_dt = time.monotonic() - _t_wall
 
     logger.info("LLM response session_id=%s", state["session_id"])
