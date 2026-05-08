@@ -11,7 +11,11 @@ import typer
 from datasets import load_dataset
 from dotenv import load_dotenv
 
-from comptroller_swebench.run_instance import resolve_max_wall_seconds, run_single_instance
+from comptroller_swebench.run_instance import (
+    resolve_max_wall_seconds,
+    resolve_termination_policy,
+    run_single_instance,
+)
 from comptroller_swebench.workspace_docker import materialize_testbed_to_host
 
 
@@ -105,6 +109,36 @@ def _run(
             "omit to use COMPTROLLER_MAX_WALL_SECONDS or max_wall_seconds env.",
         ),
     ] = None,
+    local_model_url: Annotated[
+        Optional[str],
+        typer.Option(
+            "--local-model-url",
+            help="OpenAI-compatible API base for budget-triggered local fallback "
+            "(also COMPTROLLER_LOCAL_MODEL_URL).",
+        ),
+    ] = None,
+    local_model: Annotated[
+        Optional[str],
+        typer.Option(
+            "--local-model",
+            help="Model id on --local-model-url endpoint (also COMPTROLLER_LOCAL_MODEL).",
+        ),
+    ] = None,
+    local_model_api_key: Annotated[
+        Optional[str],
+        typer.Option(
+            "--local-model-api-key",
+            help="Bearer key for --local-model-url (also COMPTROLLER_LOCAL_API_KEY).",
+        ),
+    ] = None,
+    termination_policy: Annotated[
+        Optional[str],
+        typer.Option(
+            "--termination-policy",
+            help="Optional termination policy label passed to runtime via "
+            "COMPTROLLER_TERMINATION_POLICY and recorded in JSONL.",
+        ),
+    ] = None,
 ) -> None:
     """Run Comptroller on Lite instances and append prediction lines to ``--output``."""
     load_dotenv()
@@ -170,6 +204,7 @@ def _run(
     )
     typer.echo(f"Running {len(rows)} instance(s); workspace base={root}{hint}")
     resolved_wall = resolve_max_wall_seconds(max_wall_seconds)
+    resolved_termination_policy = resolve_termination_policy(termination_policy)
     with output.open("a", encoding="utf-8") as f:
         for row in rows:
             iid = row["instance_id"]
@@ -201,6 +236,10 @@ def _run(
                     model_name_or_path=model_name_or_path,
                     db_parent=db_parent,
                     max_wall_seconds=max_wall_seconds,
+                    termination_policy=termination_policy,
+                    local_model_url=local_model_url,
+                    local_model_id=local_model,
+                    local_model_api_key=local_model_api_key,
                 )
             except Exception as e:
                 typer.echo(f"Error on {iid}: {e}", err=True)
@@ -212,6 +251,7 @@ def _run(
                     "max_tokens": max_tokens,
                     "api_dollars_used": 0.0,
                     "wall_seconds_used": 0.0,
+                    "termination_policy": resolved_termination_policy,
                 }
                 if resolved_wall is not None:
                     pred["max_wall_seconds"] = round(resolved_wall, 3)

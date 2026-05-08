@@ -36,9 +36,18 @@ comptroller = ["prompts/*.md"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "pytest-cov>=7.1.0",
+    "pygount>=1.6.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
 norecursedirs = [".git", ".venv", "harness", "SWE-bench"]
+
+[tool.coverage.report]
+omit = [
+  "src/comptroller/main.py",
+  "src/comptroller/ui.py",
+  "src/comptroller/logging_config.py"
+]

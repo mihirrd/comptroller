@@ -405,7 +405,7 @@ def test_token_budget_interactive_prefers_hold_over_local_degradation():
 
 
 def test_token_budget_exceeded_with_local_fallback_degrades_model():
-    """When token budget is exceeded and local OpenAI URL + model id are set, switch model and keep running."""
+    """When token budget is exceeded and local fallback is set, degrade and keep the same turn running."""
     state: AgentState = {
         "session_id": "test-123",
         "task": "test task",
@@ -437,9 +437,86 @@ def test_token_budget_exceeded_with_local_fallback_degrades_model():
 
     assert result["status"] == "running"
     assert result.get("model_degraded") is True
-    assert result["model"] == "openai/llama3.2"
+    assert result["model"] == "llama3.2"
     assert result["local_model_url"] == "http://127.0.0.1:11434/v1"
-    assert budget_gate(result) == "end"
+    assert result.get("continue_after_degrade") is True
+    assert budget_gate(result) == "continue"
+
+
+def test_degraded_mode_does_not_accrue_tokens_or_dollars():
+    """Once degraded, LLM usage is treated as free for budget counters."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "continue on fallback",
+        "model": "openai/llama3.2",
+        "workspace_root": "/tmp/test-ws",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [],
+        "tokens_used": 123,
+        "max_tokens": 5000,
+        "api_dollars_used": 0.42,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "running",
+        "summary": None,
+        "local_model_url": "http://127.0.0.1:11434/v1",
+        "local_model_id": "llama3.2",
+        "model_degraded": True,
+    }
+    mock_response = AIMessage(
+        content="fallback answer",
+        usage_metadata={"input_tokens": 120, "output_tokens": 40, "total_tokens": 160},
+        response_metadata={"model_name": "openai/llama3.2"},
+    )
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        result = agent_node(state)
+
+    assert result["tokens_used"] == state["tokens_used"]
+    assert result["api_dollars_used"] == state["api_dollars_used"]
+
+
+def test_degraded_mode_uses_cli_or_env_local_api_key():
+    """Fallback ChatLiteLLM init includes local API key for remote gateways."""
+    state: AgentState = {
+        "session_id": "test-123",
+        "task": "continue on fallback",
+        "model": "openai/llama3.2",
+        "workspace_root": "/tmp/test-ws",
+        "messages": [HumanMessage(content="test task")],
+        "tool_results": [],
+        "tokens_used": 0,
+        "max_tokens": 5000,
+        "api_dollars_used": 0.0,
+        "max_api_dollars": None,
+        "wall_seconds_used": 0.0,
+        "max_wall_seconds": None,
+        "session_retries_used": 0,
+        "max_session_retries": None,
+        "status": "running",
+        "summary": None,
+        "local_model_url": "https://example.gateway/v1",
+        "local_model_id": "gpt-4o-mini",
+        "local_model_api_key": "remote-gateway-key",
+        "model_degraded": True,
+    }
+    mock_response = AIMessage(content="ok")
+    with patch("comptroller.graph.ChatLiteLLM") as mock_llm_class:
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value.invoke.return_value = mock_response
+        mock_llm_class.return_value = mock_llm
+
+        agent_node(state)
+
+    kwargs = mock_llm_class.call_args.kwargs
+    assert kwargs["api_base"] == "https://example.gateway/v1"
+    assert kwargs["api_key"] == "remote-gateway-key"
 
 
 def test_budget_exceeded_triggers_summarize():

@@ -149,6 +149,16 @@ def _resolve_local_model_id(cli: str | None, session_val: str | None = None) -> 
     return None
 
 
+def _resolve_local_model_api_key(cli: str | None) -> str | None:
+    for candidate in (cli, os.environ.get("COMPTROLLER_LOCAL_API_KEY")):
+        if candidate is None:
+            continue
+        s = str(candidate).strip()
+        if s:
+            return s
+    return None
+
+
 def _interactive_budget_enabled(cli_flag: bool) -> bool:
     if cli_flag:
         return True
@@ -200,6 +210,14 @@ def run(
         typer.Option(
             "--local-model",
             help="Model name on the local server (required with --local-model-url). Also COMPTROLLER_LOCAL_MODEL.",
+        ),
+    ] = None,
+    local_model_api_key: Annotated[
+        str | None,
+        typer.Option(
+            "--local-api-key",
+            help="API key for the OpenAI-compatible fallback endpoint (for remote gateways). "
+            "Also COMPTROLLER_LOCAL_API_KEY.",
         ),
     ] = None,
     interactive_budget: Annotated[
@@ -331,6 +349,7 @@ def run(
     model_degraded_loop = False
     loc_url: str | None = None
     loc_id: str | None = None
+    loc_api_key: str | None = None
 
     # Resume existing session or create new one
     if session:
@@ -358,6 +377,7 @@ def run(
 
         loc_url = _resolve_local_model_url(local_model_url, session_data.get("local_model_url"))
         loc_id = _resolve_local_model_id(local_model_id, session_data.get("local_model_id"))
+        loc_api_key = _resolve_local_model_api_key(local_model_api_key)
         model_degraded_loop = bool(int(session_data.get("model_degraded") or 0))
         effective_model = (session_data.get("active_model") or model).strip() or model
         if model_degraded_loop and (not loc_url or not loc_id):
@@ -411,6 +431,7 @@ def run(
 
         loc_url = _resolve_local_model_url(local_model_url, None)
         loc_id = _resolve_local_model_id(local_model_id, None)
+        loc_api_key = _resolve_local_model_api_key(local_model_api_key)
         if (loc_url and not loc_id) or (loc_id and not loc_url):
             ui.print_error(
                 "Local model fallback requires both --local-model-url and --local-model "
@@ -524,6 +545,7 @@ def run(
                 max_session_retries=session_retry_cap,
                 local_model_url=loc_url,
                 local_model_id=loc_id,
+                local_model_api_key=loc_api_key,
                 model_degraded=model_degraded_loop,
                 interactive_budget=interactive_loop,
                 recent_files=turn_recent_files,
@@ -541,7 +563,11 @@ def run(
 
             def _after_agent_llm(msg: AIMessage, step: int, est: int) -> None:
                 status.stop()
-                content = msg.content if msg.content else "[Tool calls]"
+                content = msg.content
+                if not isinstance(content, str):
+                    content = str(content) if content is not None else ""
+                if not content:
+                    content = "[Tool calls]"
                 ui.print_step_llm(step, content, est)
                 if getattr(msg, "tool_calls", None):
                     status.update(f"[{ui.THEME['tool']}]● Executing tools...[/]")
@@ -673,6 +699,7 @@ def run(
                             max_session_retries=session_retry_cap,
                             local_model_url=loc_url,
                             local_model_id=loc_id,
+                            local_model_api_key=loc_api_key,
                             model_degraded=model_degraded_loop,
                             interactive_budget=interactive_loop,
                             append_user_message=False,

@@ -22,6 +22,32 @@ from .graph import SessionTransientRetryBudgetExhausted, build_graph, summarize_
 logger = logging.getLogger(__name__)
 
 
+def _coerce_message_text(content: Any) -> str:
+    """Normalize provider message content (str/list/blocks) to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                txt = item.get("text")
+                if isinstance(txt, str) and txt:
+                    parts.append(txt)
+                    continue
+                inner = item.get("content")
+                if isinstance(inner, str) and inner:
+                    parts.append(inner)
+                    continue
+            parts.append(str(item))
+        return "\n".join(p for p in parts if p)
+    if content is None:
+        return ""
+    return str(content)
+
+
 class AgentLoopCallbacks(TypedDict, total=False):
     """Optional side effects during :func:`run_agent_turn` (all no-op if omitted)."""
 
@@ -64,6 +90,7 @@ class AgentTurnInput:
     recent_files: list[str] | None = None
     local_model_url: str | None = None
     local_model_id: str | None = None
+    local_model_api_key: str | None = None
     model_degraded: bool = False
     interactive_budget: bool = False
     append_user_message: bool = True  # False: checkpoint-only continuation (e.g. after awaiting_budget)
@@ -150,6 +177,7 @@ def _build_turn_state(inp: AgentTurnInput) -> dict[str, Any]:
         "summary": None,
         "local_model_url": inp.local_model_url,
         "local_model_id": inp.local_model_id,
+        "local_model_api_key": inp.local_model_api_key,
         "model_degraded": inp.model_degraded,
         "interactive_budget": inp.interactive_budget,
     }
@@ -241,10 +269,10 @@ def run_agent_turn(
             message_chunk, metadata = data
             node = metadata.get("langgraph_node")
             if node == "agent" and message_chunk.content:
-                ai_message += message_chunk.content
+                ai_message += _coerce_message_text(message_chunk.content)
                 fn = cb.get("on_streaming_llm_text")
                 if fn:
-                    fn(message_chunk.content)
+                    fn(_coerce_message_text(message_chunk.content))
                 token_count += 1
             if stream_chunk_budget_matches_max_tokens and token_count >= inp.max_tokens:
                 streaming_hit = True
@@ -261,7 +289,9 @@ def run_agent_turn(
                         last_msg = node_state["messages"][-1]
                         if isinstance(last_msg, AIMessage):
                             step_counter += 1
-                            content = last_msg.content if last_msg.content else "[Tool calls]"
+                            content = _coerce_message_text(last_msg.content)
+                            if not content:
+                                content = "[Tool calls]"
                             est = tokens_from_llm_message(last_msg, inp.model)
                             fn = cb.get("after_agent_llm")
                             if fn:
@@ -333,6 +363,7 @@ def run_agent_turn(
             "status": "summarizing",
             "local_model_url": inp.local_model_url,
             "local_model_id": inp.local_model_id,
+            "local_model_api_key": inp.local_model_api_key,
             "model_degraded": inp.model_degraded,
             "interactive_budget": inp.interactive_budget,
         }

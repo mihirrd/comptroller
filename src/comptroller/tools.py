@@ -488,6 +488,9 @@ def apply_patch(patch_text: str) -> str:
     """Apply a unified diff (git-style) under the workspace root. Prefers `git apply`; uses `patch -p1` if no .git.
 
     Patch paths must stay inside workspace_root when COMPTROLLER_WORKSPACE_ROOT is set.
+    If this returns format/apply errors, do not loop retries with near-identical patches:
+    re-read the target file and switch to write_file (full rewrite/delete) or search_replace
+    (single, unique snippet) after at most 1-2 attempts.
     """
     if not patch_text.strip():
         return "Error: empty patch"

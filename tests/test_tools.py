@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from comptroller.tools import (
     apply_patch,
     glob_files,
     grep,
+    list_directory,
     read_file,
     search_replace,
     set_workspace_root_for_tools,
@@ -229,3 +231,106 @@ def test_grep_no_match_hints_glob_for_filename_like_pattern():
         out = grep.invoke({"pattern": "cart.py", "path": str(d)})
         assert "No matches" in out
         assert "glob_files" in out
+
+
+def test_grep_errors_when_no_backend_available(monkeypatch):
+    monkeypatch.setattr(tools_mod.shutil, "which", lambda _name: None)
+    out = grep.invoke({"pattern": "x", "path": "."})
+    assert "neither ripgrep (rg) nor grep found" in out
+
+
+def test_grep_directory_glob_filter_rejected_without_gnu_grep(monkeypatch):
+    real_which = shutil.which
+
+    def fake_which(name: str):
+        if name == "rg":
+            return None
+        if name == "grep":
+            return real_which("grep")
+        return real_which(name)
+
+    monkeypatch.setattr(tools_mod.shutil, "which", fake_which)
+    monkeypatch.setattr(tools_mod, "_grep_is_gnu_grep", lambda _bin: False)
+    with tempfile.TemporaryDirectory() as d:
+        out = grep.invoke(
+            {"pattern": "x", "path": str(d), "glob_filter": "*.py"}
+        )
+    assert "requires GNU grep or ripgrep" in out
+
+
+def test_list_directory_reports_missing_path():
+    with tempfile.TemporaryDirectory() as d:
+        out = list_directory.invoke({"path": str(Path(d) / "missing")})
+    assert "Directory not found" in out
+
+
+def test_apply_patch_rejects_empty_patch():
+    out = apply_patch.invoke({"patch_text": "   "})
+    assert "Error: empty patch" in out
+
+
+def test_apply_patch_rejects_path_outside_workspace():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        set_workspace_root_for_tools(str(root))
+        patch = """diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ /tmp/outside.txt
+@@ -0,0 +1 @@
++boom
+"""
+        out = apply_patch.invoke({"patch_text": patch})
+        assert "outside workspace" in out
+
+
+def test_apply_patch_reports_git_apply_check_failure():
+    if not shutil.which("git"):
+        pytest.skip("git not installed")
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        init = subprocess.run(
+            ["git", "init"],
+            cwd=root,
+            env=git_env,
+            capture_output=True,
+            text=True,
+        )
+        if init.returncode != 0:
+            pytest.skip("git init unavailable in this environment")
+        (root / "a.txt").write_text("hello\n")
+        subprocess.run(["git", "add", "a.txt"], cwd=root, check=True, env=git_env, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, env=git_env, capture_output=True)
+        set_workspace_root_for_tools(str(root))
+        bad_patch = """diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-goodbye
++hello
+"""
+        out = apply_patch.invoke({"patch_text": bad_patch})
+        assert "git apply --check failed" in out
+
+
+def test_run_shell_timeout(monkeypatch):
+    def fake_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="x", timeout=30)
+
+    monkeypatch.setattr(tools_mod.subprocess, "run", fake_run)
+    out = tools_mod.run_shell.invoke({"command": "sleep 999"})
+    assert "Command timed out" in out
+
+
+def test_run_shell_nonzero_includes_exit_code(monkeypatch):
+    cp = SimpleNamespace(stdout="", stderr="bad\n", returncode=3)
+    monkeypatch.setattr(tools_mod.subprocess, "run", lambda *_a, **_k: cp)
+    out = tools_mod.run_shell.invoke({"command": "false"})
+    assert "STDERR:" in out
+    assert "Exit code: 3" in out

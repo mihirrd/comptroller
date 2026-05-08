@@ -17,3 +17,6 @@ logs.txt
 # Local files
 .DS_Store
 
+**/htmlcov/
+**/.pytest_graph_integration/
+

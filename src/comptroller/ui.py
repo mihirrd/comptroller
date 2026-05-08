@@ -106,6 +106,8 @@ def print_step_tool(step: int, tool_name: str, tool_input: dict, result: str, to
 
 def print_step_llm(step: int, content: str, tokens: int):
     """Print LLM response step in a panel (one place; streaming chunks are not echoed to avoid duplicating text)."""
+    if not isinstance(content, str):
+        content = str(content) if content is not None else ""
     console.print()
     console.print(
         f"[{THEME['dim']}]#{step}[/] [{THEME['llm']}]◆ llm:reason[/]   "

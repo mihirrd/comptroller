@@ -24,5 +24,7 @@ class AgentState(TypedDict):
     # OpenAI-compatible local server (LiteLLM openai/* + api_base); used when cloud token/dollar budget is exceeded.
     local_model_url: NotRequired[str | None]
     local_model_id: NotRequired[str | None]  # model name on that server (e.g. llama3.2)
+    local_model_api_key: NotRequired[str | None]  # optional bearer token for remote OpenAI-compatible gateways
     model_degraded: NotRequired[bool]  # True after switching from primary to local endpoint
+    continue_after_degrade: NotRequired[bool]  # one-shot: re-enter agent once after degradation
     interactive_budget: NotRequired[bool]  # CLI: pause at budget for user to raise caps instead of summarizing

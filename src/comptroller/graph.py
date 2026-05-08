@@ -211,10 +211,11 @@ def _invoke_with_transient_retries(
 
 def _litellm_openai_compatible_model(local_model_id: str) -> str:
     """LiteLLM id for an OpenAI-compatible ``api_base`` (Ollama, LM Studio, vLLM, etc.)."""
-    lid = local_model_id.strip()
-    if lid.startswith("openai/"):
-        return lid
-    return f"openai/{lid}"
+    # lid = local_model_id.strip()
+    # if lid.startswith("openai/"):
+    #     return lid
+    # return f"openai/{lid}"
+    return local_model_id
 
 
 def _api_base_for_llm(state: AgentState) -> str | None:
@@ -224,16 +225,27 @@ def _api_base_for_llm(state: AgentState) -> str | None:
     return url or None
 
 
+def _api_key_for_llm(state: AgentState) -> str | None:
+    if not state.get("model_degraded"):
+        return None
+    key = (state.get("local_model_api_key") or "").strip()
+    if key:
+        return key
+    env_key = (os.environ.get("COMPTROLLER_LOCAL_API_KEY") or "").strip()
+    return env_key or None
+
+
 def _chat(
     model: str,
     temperature: float = 0,
     *,
     api_base: str | None = None,
+    api_key: str | None = None,
 ) -> ChatLiteLLM:
     """LiteLLM-backed chat model; `model` uses LiteLLM naming (provider prefixes optional).
 
-    When ``api_base`` is set (local OpenAI-compatible server), ``api_key`` defaults to
-    ``COMPTROLLER_LOCAL_API_KEY`` or the placeholder ``dummy`` (Ollama/LM Studio).
+    When ``api_base`` is set (OpenAI-compatible server), ``api_key`` is optional and
+    defaults to ``COMPTROLLER_LOCAL_API_KEY`` or the placeholder ``dummy`` (Ollama/LM Studio).
 
     ``max_retries=1`` so LangChain's inner tenacity does not stack with
     :func:`_invoke_with_transient_retries` (which applies backoff for rate limits and 5xx).
@@ -241,7 +253,7 @@ def _chat(
     kwargs: dict[str, Any] = {"model": model, "temperature": temperature, "max_retries": 1}
     if api_base:
         kwargs["api_base"] = api_base.rstrip("/")
-        key = (os.environ.get("COMPTROLLER_LOCAL_API_KEY") or "").strip() or "dummy"
+        key = (api_key or "").strip() or (os.environ.get("COMPTROLLER_LOCAL_API_KEY") or "").strip() or "dummy"
         kwargs["api_key"] = key
     return ChatLiteLLM(**kwargs)
 
@@ -259,6 +271,9 @@ def _apply_model_degradation(new_state: AgentState, prev_state: AgentState) -> N
     new_state["local_model_url"] = url
     new_state["local_model_id"] = mid
     new_state["model_degraded"] = True
+    # Force one additional agent step on the degraded model so the same user
+    # turn can continue without waiting for the next CLI prompt.
+    new_state["continue_after_degrade"] = True
     new_state["status"] = "running"
     logger.info(
         "Model degradation: using local OpenAI-compatible endpoint api_base=%s litellm_model=%s",
@@ -517,7 +532,11 @@ def agent_node(state: AgentState) -> AgentState:
     messages_for_llm = _prepare_messages_for_llm(messages)
 
     # Initialize LLM with tools
-    llm = _chat(state["model"], api_base=_api_base_for_llm(state))
+    llm = _chat(
+        state["model"],
+        api_base=_api_base_for_llm(state),
+        api_key=_api_key_for_llm(state),
+    )
     llm_with_tools = llm.bind_tools(TOOLS)
 
     logger.info(
@@ -542,13 +561,17 @@ def agent_node(state: AgentState) -> AgentState:
 
     tokens = tokens_from_llm_message(response, state["model"])
     call_dollars = dollars_from_llm_message(response, state["model"])
+    billable_tokens = 0 if state.get("model_degraded") else tokens
+    billable_dollars = 0.0 if state.get("model_degraded") else call_dollars
 
     # Update state
     new_state = state.copy()
-    new_state["tokens_used"] = state["tokens_used"] + tokens
-    new_state["api_dollars_used"] = state["api_dollars_used"] + call_dollars
+    new_state["tokens_used"] = state["tokens_used"] + billable_tokens
+    new_state["api_dollars_used"] = state["api_dollars_used"] + billable_dollars
     new_state["wall_seconds_used"] = state["wall_seconds_used"] + _wall_dt
     new_state["messages"] = _state_messages_with_sliding_window(state["messages"] + [response])
+    # One-shot flag consumed by budget_gate; default false each agent step.
+    new_state["continue_after_degrade"] = False
 
     cap = state.get("max_api_dollars")
     wcap = state.get("max_wall_seconds")
@@ -558,10 +581,10 @@ def agent_node(state: AgentState) -> AgentState:
         state["session_id"],
         state["model"],
         bool(state.get("model_degraded")),
-        tokens,
+        billable_tokens,
         new_state["tokens_used"],
         state["max_tokens"],
-        call_dollars,
+        billable_dollars,
         new_state["api_dollars_used"],
         cap,
         _wall_dt,
@@ -604,7 +627,7 @@ def tool_node_wrapper(state: AgentState) -> AgentState:
 
     for msg in tool_messages:
         content = msg.content if hasattr(msg, "content") else str(msg)
-        tokens = count_tokens(content)
+        tokens = 0 if state.get("model_degraded") else count_tokens(content)
         total_tokens += tokens
 
         # Log tool result
@@ -650,6 +673,9 @@ def budget_gate(state: AgentState) -> str:
     last = state["messages"][-1]
     if hasattr(last, "tool_calls") and last.tool_calls:
         return "tools"
+
+    if state.get("continue_after_degrade"):
+        return "continue"
 
     return "end"
 
@@ -760,6 +786,7 @@ def build_graph(db_path: str = "~/.agent-runtime-mvp/sessions.db"):
         budget_gate,
         {
             "tools": "tools",
+            "continue": "agent",
             "summarize": "summarize",
             "end": END,
         },
@@ -795,6 +822,7 @@ def run_graph(
     *,
     local_model_url: str | None = None,
     local_model_id: str | None = None,
+    local_model_api_key: str | None = None,
     model_degraded: bool = False,
     interactive_budget: bool = False,
 ):
@@ -822,6 +850,7 @@ def run_graph(
         "recent_files": [],
         "local_model_url": local_model_url,
         "local_model_id": local_model_id,
+        "local_model_api_key": local_model_api_key,
         "model_degraded": model_degraded,
         "interactive_budget": interactive_budget,
     }

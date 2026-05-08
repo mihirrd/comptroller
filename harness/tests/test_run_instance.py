@@ -1,6 +1,6 @@
 """Tests for SWE-bench run_instance helpers."""
 
-from comptroller_swebench.run_instance import resolve_max_wall_seconds
+from comptroller_swebench.run_instance import resolve_max_wall_seconds, resolve_termination_policy
 
 
 def test_resolve_max_wall_seconds_explicit_positive():
@@ -32,3 +32,20 @@ def test_resolve_max_wall_seconds_explicit_overrides_env(monkeypatch):
     monkeypatch.setenv("COMPTROLLER_MAX_WALL_SECONDS", "999")
     assert resolve_max_wall_seconds(10.0) == 10.0
     monkeypatch.delenv("COMPTROLLER_MAX_WALL_SECONDS", raising=False)
+
+
+def test_resolve_termination_policy_explicit_overrides_env(monkeypatch):
+    monkeypatch.setenv("COMPTROLLER_TERMINATION_POLICY", "env_policy")
+    assert resolve_termination_policy("strict_patch_fallback") == "strict_patch_fallback"
+    monkeypatch.delenv("COMPTROLLER_TERMINATION_POLICY", raising=False)
+
+
+def test_resolve_termination_policy_from_env(monkeypatch):
+    monkeypatch.setenv("COMPTROLLER_TERMINATION_POLICY", "strict_patch_fallback")
+    assert resolve_termination_policy(None) == "strict_patch_fallback"
+    monkeypatch.delenv("COMPTROLLER_TERMINATION_POLICY", raising=False)
+
+
+def test_resolve_termination_policy_default(monkeypatch):
+    monkeypatch.delenv("COMPTROLLER_TERMINATION_POLICY", raising=False)
+    assert resolve_termination_policy(None) == "default"

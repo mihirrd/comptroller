@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from comptroller_swebench.patch import git_diff
 from comptroller_swebench.prompt import build_task_prompt
 
 logger = logging.getLogger(__name__)
+DEFAULT_TERMINATION_POLICY = "default"
 
 
 def _max_wall_seconds_from_env() -> float | None:
@@ -37,6 +39,29 @@ def resolve_max_wall_seconds(explicit: float | None) -> float | None:
     return _max_wall_seconds_from_env()
 
 
+def resolve_termination_policy(explicit: str | None) -> str:
+    """CLI value wins; otherwise COMPTROLLER_TERMINATION_POLICY; fallback to ``default``."""
+    if explicit is not None and explicit.strip():
+        return explicit.strip()
+    env_val = (os.environ.get("COMPTROLLER_TERMINATION_POLICY") or "").strip()
+    if env_val:
+        return env_val
+    return DEFAULT_TERMINATION_POLICY
+
+
+@contextmanager
+def _temporary_env(name: str, value: str):
+    prev = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = prev
+
+
 def run_single_instance(
     instance: dict[str, Any],
     *,
@@ -46,6 +71,10 @@ def run_single_instance(
     model_name_or_path: str,
     db_parent: Path | None = None,
     max_wall_seconds: float | None = None,
+    termination_policy: str | None = None,
+    local_model_url: str | None = None,
+    local_model_id: str | None = None,
+    local_model_api_key: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Execute the agent for one dataset row and return a SWE-bench prediction + patch text.
 
@@ -67,6 +96,7 @@ def run_single_instance(
     db_path = str(db_dir / "sessions.db")
 
     wall_cap = resolve_max_wall_seconds(max_wall_seconds)
+    policy = resolve_termination_policy(termination_policy)
 
     inp = AgentTurnInput(
         task=task,
@@ -75,17 +105,21 @@ def run_single_instance(
         workspace_root=str(root),
         max_tokens=max_tokens,
         max_wall_seconds=wall_cap,
+        local_model_url=local_model_url,
+        local_model_id=local_model_id,
+        local_model_api_key=local_model_api_key,
     )
 
     result: AgentTurnResult | None = None
     try:
-        result = run_agent_turn(
-            inp,
-            db_path=db_path,
-            graph=None,
-            log_steps_to_store=False,
-            stream_chunk_budget_matches_max_tokens=False,
-        )
+        with _temporary_env("COMPTROLLER_TERMINATION_POLICY", policy):
+            result = run_agent_turn(
+                inp,
+                db_path=db_path,
+                graph=None,
+                log_steps_to_store=False,
+                stream_chunk_budget_matches_max_tokens=False,
+            )
         if result.final_state is None:
             logger.warning("instance %s: graph returned no final state", iid)
         elif result.final_state.get("status") == "summarizing":
@@ -101,7 +135,12 @@ def run_single_instance(
         "instance_id": iid,
         "model_name_or_path": model_name_or_path,
         "model_patch": patch,
+        "termination_policy": policy,
     }
+    if local_model_url:
+        pred["local_model_url"] = local_model_url
+    if local_model_id:
+        pred["local_model_id"] = local_model_id
     if result is not None:
         pred["tokens_used"] = result.current_tokens
         pred["max_tokens"] = max_tokens
